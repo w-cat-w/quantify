@@ -1,128 +1,144 @@
-﻿# Polymarket Weather Master
+# Polymarket Weather Master
 
-基于 py-clob-client 和 requests 的 Polymarket 气象量化交易机器人。
-当前策略聚焦纽约拉瓜迪亚机场 (LGA) 未来三天最高气温市场 (T0/T1/T2)。
-当前版本已扩展为多城市并行（默认常见城市），每个城市使用与 NYC 相同的策略逻辑。
-默认城市包括：New York、Miami、Chicago、Atlanta、Toronto、London、Paris、Brussels、Vienna、Seoul、Tokyo、Dallas、Ankara、Buenos Aires、Wellington、Sydney。
+基于 `py-clob-client + requests` 的 Polymarket 气象量化交易机器人。  
+当前版本已支持多城市、多天气源、YES/NO 双向交易、持仓成本跟踪、止盈止损、历史回放与诊断面板。
 
-## 项目能力
+代码主入口：`Quantify.py`（核心类：`PolymarketWeatherMaster`）
 
-- 纽约时区日期管理：自动计算 T0/T1/T2，输出 Polymarket 标题日期格式（如 March 4）。
-- 动态市场发现：自动发现市场并提取 conditionId、outcomes、clobTokenIds。
-- 气象预测：优先 Open-Meteo HRRR，失败回退 GFS；按日计算最高温。
-- 量化信号：计算 fair_prob、market_price、edge，并输出 BUY/HOLD/REDUCE。
-- 持仓感知：读取 token 持仓，支持仓位上限和负 edge 减仓。
-- 小资金适配：根据 USDC 余额动态调整下单金额，不再固定 10 美元。
-- 容错机制：网络重试、429 限频退避、CLOB 401/403 自动刷新凭证。
+## 功能概览
 
-## 核心文件
+- 多城市扫描：默认覆盖 New York、Miami、Chicago、Atlanta、Toronto、London、Paris、Brussels、Vienna、Seoul、Tokyo、Dallas、Ankara、Buenos Aires、Wellington、Sydney、Seattle、Sao Paulo、Munich、Lucknow。
+- 动态市场发现：基于 Gamma `/events` 搜索与评分，自动锁定 T0/T1/T2（纽约时区）目标天气市场。
+- YES/NO 双向交易：同一区间同时评估 YES 与 NO 的 `fair_prob/price/edge`，按 Edge 统一排序决策。
+- 多源天气融合：优先尝试 Open-Meteo 模型（含 HRRR/GFS 相关），并融合 NWS、METAR、fallback 源。
+- 风控体系：最小概率/价格过滤、相对优势过滤、仓位上限、全局暴露上限、日内亏损熔断 Standby。
+- 持仓管理：加权成本、浮盈亏、止盈/止损/模型反转平仓、临近结算防守减仓。
+- 报告系统：每轮输出 `latest_actions.json`、历史快照、`diagnostics.json`，并提供前端回放页面。
+- 单实例保护：文件锁防止多开同一脚本。
 
-- Quantify.py
+## 核心流程
 
-核心类：PolymarketWeatherMaster
+1. 按纽约时区计算交易日期（T0/T1/T2）并构造日期标签（如 `March 4`）。
+2. 先做市场探测（Discovery），找到可交易 condition 与 outcome token。
+3. 获取城市未来 3 天最高温预测（多数据源融合）。
+4. 对每个区间计算：
+   - `fair_prob_yes` 与 `fair_prob_no = 1 - fair_prob_yes`
+   - 市场价格、绝对 edge、相对 edge（edge_ratio）
+5. 在风控条件满足时执行交易（BUY/HOLD/REDUCE），并记录成本、日志、历史与诊断。
 
-## 策略概要
+## 默认交易与风控参数（当前代码）
 
-1. 发现未来三天 NYC 高温市场。
-2. 获取 LGA 三天温度预测并计算每日最高温。
-3. 对每个 outcome 计算模型概率 fair_prob。
-4. 从 CLOB 获取买价 market_price，计算 edge = fair_prob - market_price。
-5. 满足稳定性、edge、仓位和资金约束时买入；负 edge 时减仓。
+- `bankroll_fraction=0.18`
+- `edge_threshold=0.10`
+- `min_fair_prob=0.15`
+- `min_market_price=0.10`
+- `max_market_price=0.70`
+- `min_edge_ratio=1.25`
+- `min_trade_usdc=1.0`（受交易所最小买入约束）
+- `max_trade_usdc=2.0`
+- `total_exposure_limit=0.80`
+- `take_profit_ratio=1.12`
+- `stop_loss_ratio=0.96`
+- `daily_loss_limit_ratio=0.30`（触发 Standby）
+- `min_hours_to_settlement_for_entry=12.0`
+- `single_outcome_per_condition=True`
 
-## 风控与资金管理
+说明：这些参数都在 `Quantify.py` 构造函数中，可按实盘反馈继续调优。
 
-固定风控：
-- edge_threshold：买入最小优势阈值（默认 0.08）。
-- max_position_shares_per_token：单 token 份额上限。
-- max_total_position_shares_per_condition：单 condition 总份额上限。
-- reduce_fraction_on_negative_edge：负 edge 减仓比例（默认 0.5）。
+## 环境准备
 
-小资金自适应：
-- capital_utilization_per_trade：每笔最多使用余额比例。
-- capital_reserve_usdc：预留不交易资金。
-- min_trade_usdc：最小下单金额，低于该值不下单。
-- max_token_exposure_ratio：单 token 资金暴露比例上限。
-- max_condition_exposure_ratio：单 condition 资金暴露比例上限。
-
-## 依赖安装
-
-在项目目录执行：
+### 1) 安装依赖
 
 ```powershell
 .\.venv\Scripts\pip.exe install py-clob-client requests pytz
 ```
 
-## 私钥配置（环境变量）
+### 2) 配置私钥与账户参数
 
-程序入口只从环境变量读取私钥：POLYMARKET_PRIVATE_KEY
+程序启动时会自动读取项目根目录 `.env`（若存在），并以环境变量为准。
 
-当前终端生效：
+必填：
+
+- `POLYMARKET_PRIVATE_KEY=0x...`（64 位十六进制私钥）
+
+可选（代理钱包/邮箱钱包常用）：
+
+- `POLYMARKET_SIGNATURE_TYPE=0|1|2`
+- `POLYMARKET_FUNDER=0x...`
+
+循环配置（可选）：
+
+- `POLY_LOOP_INTERVAL_SECONDS=300`（默认 5 分钟）
+- `POLY_HEARTBEAT_SECONDS=3600`
+- `POLY_DRY_RUN=true|false`
+
+PowerShell 临时设置示例：
 
 ```powershell
-$env:POLYMARKET_PRIVATE_KEY="0x你的64位十六进制私钥"
+$env:POLYMARKET_PRIVATE_KEY="0x你的私钥"
+$env:POLYMARKET_SIGNATURE_TYPE="1"
+$env:POLYMARKET_FUNDER="0x你的funder地址"
 ```
 
-持久化到用户环境变量：
+## 运行方式
 
-```powershell
-[Environment]::SetEnvironmentVariable("POLYMARKET_PRIVATE_KEY","0x你的64位十六进制私钥","User")
-```
-
-## 运行
+### 方式 A：直接运行主脚本
 
 ```powershell
 .\.venv\Scripts\python.exe .\Quantify.py
 ```
 
-默认 dry_run=True（仅信号，不实盘下单）。
-需要实盘时，将 Quantify.py 入口中的 dry_run 改为 False。
+### 方式 B：看门狗模式（自动重启）
 
-## 静态页面查看机会与操作
+```powershell
+.\start_bot_watchdog.bat
+```
 
-脚本每轮会自动输出：
+## 输出文件与前端回放
 
-- `reports/latest_actions.json`
-- `reports/history_index.json`（按日期倒序索引）
-- `reports/history/*.json`（每轮快照）
-- `frontend/history_viewer.html`（历史查询页面，前后端分离）
+每轮执行会写入：
 
-直接打开 `frontend/history_viewer.html` 即可查看。  
-如果浏览器本地文件限制较严，建议在项目目录启动一个静态服务：
+- `reports/latest_actions.json`：最新一轮策略结果
+- `reports/history/*.json`：历史快照
+- `reports/history_index.json`：历史索引（倒序）
+- `reports/diagnostics.json`：最新一轮诊断数据（含 YES/NO 双向对比）
+- `reports/positions_cost.json`：持仓成本缓存
+- `reports/daily_realized_pnl.json`：日内已实现盈亏
+
+前端页面：
+
+- `frontend/history_viewer.html`
+
+启动静态服务并访问：
 
 ```powershell
 .\.venv\Scripts\python.exe -m http.server 8000
 ```
 
-然后访问：
-
 - `http://127.0.0.1:8000/frontend/history_viewer.html`
 
-历史页面用法：
+页面支持：
 
-1. 先选日期（下拉框）。  
-2. 再选该日期下的一次运行批次（按时间倒序）。  
-3. 输入关键词筛选该批次里的机会和操作记录。
-4. 若当轮无交易机会，页面也会显示 `[DISCOVERY]` 行，说明每个日期的市场发现结果与跳过原因。
-5. 页面顶部会显示“运行摘要卡片”（BUY/HOLD/REDUCE、DISCOVERY FOUND/SKIP、总记录）。
+- 历史批次筛选
+- BUY/HOLD/REDUCE 回放
+- Discovery 发现结果展示
+- YES/NO 同区间价格、公允概率、Edge 对比与推荐方向
 
 ## 常见问题
 
-1. 报错 Could not discover market for March X
-- 已改为跳过当日，不会中断整轮。
-- 常见原因是当天市场未上线或 Gamma query 返回无关结果。
+1. 看起来“没下单”
+- 先看 `reports/latest_actions.json` 的 `hold_reason`。
+- 常见原因：`SETTLE_TOO_NEAR`、`PRICE_TOO_LOW`、`PROB_TOO_LOW`、`total_exposure_limit`、`daily_loss_standby_active`。
 
-2. 日志出现 POST /auth/api-key 400，随后 GET /auth/derive-api-key 200
-- 通常可恢复，不是致命错误。
+2. 为什么有两个 python 进程
+- 可能是父子进程关系，不一定是双实例。
+- 以单实例锁文件 `reports/quantify_bot.lock` 为准；若重复启动，会被拦截退出。
 
-3. PowerShell 设置变量报语法错误
-- 设置变量和运行命令要分行，或用分号分隔：
+3. 日志有 `POST /auth/api-key 400` 但随后恢复
+- 常见于凭证刷新流程，不一定是致命错误；关注后续是否有 `CLOB API credentials refreshed`。
 
-```powershell
-$env:POLYMARKET_PRIVATE_KEY="0x你的私钥"; .\.venv\Scripts\python.exe .\Quantify.py
-```
+## 安全说明
 
-## 安全提示
-
-- 不要把私钥写入代码仓库。
-- 私钥一旦泄露，立即更换并转移资产。
-- 本项目仅供研究和自动化示例，不构成投资建议。
+- 私钥不要提交到仓库。
+- 建议仅用小额资金做参数验证。
+- 本项目仅作技术研究与自动化示例，不构成投资建议。
