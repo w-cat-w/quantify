@@ -1,0 +1,79 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Polymarket 天气历史回放</title>
+  <link rel="stylesheet" href="./history_viewer.css" />
+</head>
+<body>
+  <div class="wrap">
+    <section class="hero">
+      <h1>Polymarket Weather</h1>
+      <div class="sub">历史回放</div>
+    </section>
+
+    <section class="panel sticky">
+      <div class="filters">
+        <div>
+          <div class="label">日期</div>
+          <select id="dateSel"></select>
+        </div>
+        <div>
+          <div class="label">批次（最新在前）</div>
+          <select id="runSel"></select>
+        </div>
+        <div>
+          <div class="label">搜索</div>
+          <input id="q" placeholder="搜索标签、token、condition、问题..." />
+        </div>
+        <div>
+          <div class="label">每页条数</div>
+          <select id="pageSize">
+            <option value="10">10</option>
+            <option value="20" selected>20</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="meta" id="meta"></div>
+      <div class="cards" id="summary"></div>
+    </section>
+
+    <section class="panel">
+      <div class="toolbar">
+        <div id="rowsInfo" class="small"></div>
+        <div class="pager">
+          <button id="prevBtn" class="btn">上一页</button>
+          <span id="pageInfo" class="small"></span>
+          <button id="nextBtn" class="btn">下一页</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>城市</th>
+              <th>日期</th>
+              <th>信号</th>
+              <th>市场标签</th>
+              <th>价格/概率</th>
+              <th>边际/盈亏</th>
+              <th>仓位/成本</th>
+              <th>资金管理</th>
+              <th>问题 / 说明</th>
+            </tr>
+          </thead>
+          <tbody id="tbody"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <script src="./history_viewer.js"></script>
+</body>
+</html>
