@@ -4,6 +4,7 @@ import math
 import os
 import random
 import re
+import statistics
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -20,6 +21,15 @@ from py_clob_client.exceptions import PolyApiException
 
 # 全局日志对象：统一使用同一个 logger，方便接入监控系统
 LOGGER = logging.getLogger("polymarket_weather_master")
+
+try:
+    import msvcrt
+except Exception:  # pragma: no cover
+    msvcrt = None
+
+
+# 单实例锁句柄（进程生命周期内保持打开）
+_SINGLE_INSTANCE_LOCK_FP = None
 
 
 def load_env_file(path: str = ".env") -> None:
@@ -42,14 +52,42 @@ def load_env_file(path: str = ".env") -> None:
             os.environ[key] = val
 
 
+def acquire_single_instance_lock(lock_file: str = "reports/quantify_bot.lock") -> bool:
+    """
+    获取单实例文件锁（Windows）。
+    返回 True 表示拿到锁，False 表示已有实例在运行。
+    """
+    global _SINGLE_INSTANCE_LOCK_FP
+    if msvcrt is None:
+        return True
+    lock_path = Path(lock_file)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fp = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fp.seek(0)
+        # 锁定首字节，非阻塞；已被占用时抛 OSError
+        msvcrt.locking(fp.fileno(), msvcrt.LK_NBLCK, 1)
+        fp.seek(0)
+        fp.truncate(0)
+        fp.write(str(os.getpid()))
+        fp.flush()
+        _SINGLE_INSTANCE_LOCK_FP = fp
+        return True
+    except OSError:
+        fp.close()
+        return False
+
+
 @dataclass
 class OutcomeToken:
     """单个 outcome 的结构化信息。"""
 
     # Polymarket outcome 文本，例如 "48F to 50F"
     label: str
-    # 该 outcome 在 CLOB 上可交易的 token id
-    token_id: str
+    # 该区间 YES 方向 token id
+    yes_token_id: str
+    # 该区间 NO 方向 token id
+    no_token_id: str
 
 
 @dataclass
@@ -337,20 +375,20 @@ class PolymarketWeatherMaster:
         max_condition_exposure_ratio: float = 0.85,
         use_limit_buy_order: bool = True,
         limit_buy_slippage_tolerance: float = 0.02,
-        take_profit_ratio: float = 1.2,
-        stop_loss_ratio: float = 0.93,
-        take_profit_sell_fraction: float = 0.5,
+        take_profit_ratio: float = 1.12,
+        stop_loss_ratio: float = 0.96,
+        take_profit_sell_fraction: float = 0.8,
         min_hours_to_settlement_for_entry: float = 12.0,
         single_outcome_per_condition: bool = True,
-        pre_settle_hours: float = 12.0,
-        pre_settle_min_pnl_ratio: float = 0.10,
+        pre_settle_hours: float = 18.0,
+        pre_settle_min_pnl_ratio: float = 0.05,
         pre_settle_reduce_fraction: float = 0.5,
         enable_daily_loss_standby: bool = True,
         daily_loss_limit_ratio: float = 0.30,
         dust_notional_threshold_usdc: float = 1.0,
         standby_force_exit_min_notional: float = 0.2,
         sell_limit_discount: float = 0.01,
-        total_exposure_limit: float = 0.60,
+        total_exposure_limit: float = 0.80,
         positions_cost_file: str = "positions_cost.json",
         daily_realized_pnl_file: str = "daily_realized_pnl.json",
         report_dir: str = "reports",
@@ -440,6 +478,8 @@ class PolymarketWeatherMaster:
         self.total_exposure_limit = min(0.95, max(0.1, total_exposure_limit))
         # 报告输出目录（JSON + HTML）
         self.report_dir = Path(report_dir)
+        # 高频诊断日志文件（每轮覆盖写入最新完整决策上下文）
+        self.diagnostics_file = self.report_dir / "diagnostics.json"
         # 是否每轮写静态报告
         self.write_static_report = write_static_report
         # 是否写历史快照与历史索引
@@ -576,6 +616,8 @@ class PolymarketWeatherMaster:
 
     def _get_today_realized_pnl(self) -> float:
         """获取当日（纽约日期）累计已实现盈亏。"""
+        # 每轮读取最新文件，确保手动清零/修正后立即生效
+        self._load_daily_realized_pnl()
         return float(self.daily_realized_pnl.get(self._today_nyc_key(), 0.0))
 
     def _record_realized_pnl(self, pnl_usdc: float) -> None:
@@ -742,7 +784,7 @@ class PolymarketWeatherMaster:
         url: str,
         params: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
-        max_retries: int = 5,
+        max_retries: int = 3,
     ) -> Any:
         """
         通用 HTTP JSON 请求，内置容错：
@@ -762,10 +804,10 @@ class PolymarketWeatherMaster:
                     # 处理 API 频率限制：优先尊重 Retry-After，其次使用指数退避+抖动
                     retry_after = resp.headers.get("Retry-After")
                     if retry_after and str(retry_after).isdigit():
-                        sleep_s = min(60.0, float(retry_after))
+                        sleep_s = min(12.0, float(retry_after))
                     else:
-                        base = min(30.0, 1.2 * (2**attempt))
-                        sleep_s = base + random.uniform(0.2, 1.2)
+                        base = min(6.0, 0.8 * (2**attempt))
+                        sleep_s = base + random.uniform(0.1, 0.6)
                     LOGGER.warning("Rate limited: %s. Sleep %.2fs", url, sleep_s)
                     time.sleep(sleep_s)
                     continue
@@ -779,8 +821,8 @@ class PolymarketWeatherMaster:
                 if attempt == max_retries - 1:
                     # 最后一次仍失败，抛出给上层处理
                     raise
-                base = min(20.0, 1.1 * (2**attempt))
-                sleep_s = base + random.uniform(0.1, 0.9)
+                base = min(5.0, 0.7 * (2**attempt))
+                sleep_s = base + random.uniform(0.1, 0.5)
                 LOGGER.warning("Request failed (%s): %s. Retry in %.2fs", url, exc, sleep_s)
                 time.sleep(sleep_s)
 
@@ -1053,18 +1095,23 @@ class PolymarketWeatherMaster:
             if len(token_ids) != len(outcome_labels) or not token_ids:
                 continue
 
-            # 二元市场默认取 YES token 对应该温度区间；若没有 Yes，则回退第一个 token
-            yes_idx = 0
+            yes_idx: Optional[int] = None
+            no_idx: Optional[int] = None
             for idx, lab in enumerate(outcome_labels):
-                if str(lab).strip().lower() == "yes":
+                norm = str(lab).strip().lower()
+                if norm == "yes":
                     yes_idx = idx
-                    break
+                elif norm == "no":
+                    no_idx = idx
+            if yes_idx is None or no_idx is None:
+                continue
 
             band_label = self._extract_band_label_from_question(q, date_label) or q
             yes_token_id = str(token_ids[yes_idx]).strip()
-            if not yes_token_id:
+            no_token_id = str(token_ids[no_idx]).strip()
+            if not yes_token_id or not no_token_id:
                 continue
-            outcomes.append(OutcomeToken(label=band_label, token_id=yes_token_id))
+            outcomes.append(OutcomeToken(label=band_label, yes_token_id=yes_token_id, no_token_id=no_token_id))
 
         if not outcomes:
             return None
@@ -1203,16 +1250,28 @@ class PolymarketWeatherMaster:
                 labels = self._parse_json_if_needed(m.get("outcomes"))
                 if len(token_ids) != len(labels) or not token_ids:
                     continue
-                yes_idx = 0
+                yes_idx: Optional[int] = None
+                no_idx: Optional[int] = None
                 for idx, lab in enumerate(labels):
-                    if str(lab).strip().lower() == "yes":
+                    norm = str(lab).strip().lower()
+                    if norm == "yes":
                         yes_idx = idx
-                        break
-                token_id = str(token_ids[yes_idx]).strip()
-                if not token_id:
+                    elif norm == "no":
+                        no_idx = idx
+                if yes_idx is None or no_idx is None:
+                    continue
+                yes_token_id = str(token_ids[yes_idx]).strip()
+                no_token_id = str(token_ids[no_idx]).strip()
+                if not yes_token_id or not no_token_id:
                     continue
                 band_label = self._extract_band_label_from_question(q, date_label) or q
-                outcomes.append(OutcomeToken(label=band_label, token_id=token_id))
+                outcomes.append(
+                    OutcomeToken(
+                        label=band_label,
+                        yes_token_id=yes_token_id,
+                        no_token_id=no_token_id,
+                    )
+                )
                 cid = str(m.get("conditionId") or "")
                 if cid:
                     condition_ids.append(cid)
@@ -1679,6 +1738,7 @@ class PolymarketWeatherMaster:
         forecast_unit: str = "fahrenheit",
         settle_time_iso: str = "",
         base_sigma_f: Optional[float] = None,
+        forecast_dispersion: Optional[float] = None,
     ) -> float:
         """
         给定预测最高温，计算落入 outcome 区间的“模型概率”。
@@ -1699,6 +1759,12 @@ class PolymarketWeatherMaster:
         has_hrrr = ("hrrr" in src_text)
         if not has_hrrr:
             sigma_base = sigma_base * 1.8
+        # 预测离散度动态 sigma：多源分歧越大，sigma 越大（不确定性放大）
+        if isinstance(forecast_dispersion, (int, float)) and float(forecast_dispersion) > 0:
+            disp = float(forecast_dispersion)
+            if outcome_unit == "celsius":
+                disp = self._convert_temperature(disp, forecast_unit, "celsius")
+            sigma_base = sigma_base + (0.7 * max(0.0, disp))
         # 给 sigma 设置下限，防止过小导致数值过于极端
         sigma = max(0.5, sigma_base)
 
@@ -2463,7 +2529,7 @@ class PolymarketWeatherMaster:
         rows: List[Dict[str, Any]] = []
         for item in self.last_discovery_debug:
             status = str(item.get("status") or "")
-            signal = "HOLD" if status == "SKIP" else "BUY"
+            signal = "HOLD" if status == "SKIP" else "DISCOVERY"
             reason = str(item.get("reason") or "")
             city = str(item.get("city") or "")
             if status == "FOUND":
@@ -2542,7 +2608,12 @@ class PolymarketWeatherMaster:
 
         LOGGER.info("History snapshot written: %s | index=%s", rel_file, idx_path)
 
-    def _write_static_report(self, actions: List[Dict[str, Any]]) -> None:
+    def _write_static_report(
+        self,
+        actions: List[Dict[str, Any]],
+        write_history: Optional[bool] = None,
+        progress: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """写出静态报告文件，并可选写历史快照。"""
         self.report_dir.mkdir(parents=True, exist_ok=True)
         generated_dt = datetime.now(self.NYC_TZ)
@@ -2554,13 +2625,50 @@ class PolymarketWeatherMaster:
             "actions": actions,
             "run_summary": run_summary,
         }
+        if isinstance(progress, dict):
+            payload["progress"] = progress
 
         json_path = self.report_dir / "latest_actions.json"
         json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         LOGGER.info("Static report written: %s", json_path)
 
-        if self.write_history_report:
+        should_write_history = self.write_history_report if write_history is None else bool(write_history)
+        if should_write_history:
             self._write_history_snapshot(generated_dt, actions)
+
+    def _compute_source_dispersion_for_date(self, date_key: str) -> float:
+        """
+        计算指定日期多气象源预测值的标准差（用于动态 sigma）。
+        若源不足 2 个，返回 0。
+        """
+        details = self.current_model_details if isinstance(self.current_model_details, dict) else {}
+        sources = details.get("sources", {}) if isinstance(details.get("sources", {}), dict) else {}
+        vals: List[float] = []
+        for daily in sources.values():
+            if not isinstance(daily, dict):
+                continue
+            if date_key in daily:
+                try:
+                    vals.append(float(daily[date_key]))
+                except Exception:
+                    continue
+        if len(vals) < 2:
+            return 0.0
+        try:
+            return float(statistics.pstdev(vals))
+        except Exception:
+            return 0.0
+
+    def _write_diagnostics(self, payload: Dict[str, Any]) -> None:
+        """写出高频诊断文件 diagnostics.json（每轮覆盖，保留最新全量决策上下文）。"""
+        try:
+            self.report_dir.mkdir(parents=True, exist_ok=True)
+            self.diagnostics_file.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            LOGGER.warning("Failed to write diagnostics file: %s", exc)
 
     def check_and_exit_positions(
         self,
@@ -2697,6 +2805,7 @@ class PolymarketWeatherMaster:
         4) 选取当日最优 outcome 判定 BUY/HOLD
         """
         actions: List[Dict[str, Any]] = []
+        diagnostics_rows: List[Dict[str, Any]] = []
         covered_token_ids: set = set()
         diag = self._diagnose_account_status()
         available_usdc = float(diag.get("usdc_balance", 0.0))
@@ -2739,14 +2848,26 @@ class PolymarketWeatherMaster:
             self._city_scan_cursor = (self._city_scan_cursor + 1) % len(self.city_configs)
         else:
             city_order = []
+        total_cities = len(city_order)
         LOGGER.info("City scan order: %s", [c.get("name", "") for c in city_order])
 
-        for city_cfg in city_order:
+        for city_idx, city_cfg in enumerate(city_order, start=1):
             city_name = city_cfg["name"]
             markets = self.discover_daily_markets(city_cfg)
             if not markets:
                 LOGGER.warning("%s: no discovered markets this round.", city_name)
                 actions.extend(self._build_discovery_debug_rows())
+                if self.write_static_report:
+                    self._write_static_report(
+                        actions,
+                        write_history=False,
+                        progress={
+                            "stage": "city_no_market",
+                            "city": city_name,
+                            "city_index": city_idx,
+                            "total_cities": total_cities,
+                        },
+                    )
                 continue
 
             # 仅当至少一个日期探测成功后，再请求天气预测
@@ -2755,8 +2876,19 @@ class PolymarketWeatherMaster:
             except Exception as exc:
                 LOGGER.warning("%s forecast fetch failed after discovery: %s", city_name, exc)
                 actions.extend(self._build_discovery_debug_rows())
+                if self.write_static_report:
+                    self._write_static_report(
+                        actions,
+                        write_history=False,
+                        progress={
+                            "stage": "city_forecast_failed",
+                            "city": city_name,
+                            "city_index": city_idx,
+                            "total_cities": total_cities,
+                            "error": str(exc),
+                        },
+                    )
                 continue
-
             forecast_unit_name = str(city_cfg.get("temp_unit", "fahrenheit")).lower()
             city_base_sigma = float(city_cfg.get("base_sigma", self.temp_sigma_f) or self.temp_sigma_f)
             for date_key, market in markets.items():
@@ -2776,31 +2908,89 @@ class PolymarketWeatherMaster:
 
                 scored: List[Dict[str, Any]] = []
                 for out in market.outcomes:
-                    covered_token_ids.add(str(out.token_id))
-                    fair_prob = self.model_probability(
+                    covered_token_ids.add(str(out.yes_token_id))
+                    covered_token_ids.add(str(out.no_token_id))
+                    fair_prob_yes = self.model_probability(
                         forecast_max,
                         out.label,
                         forecast_unit=forecast_unit_name,
                         settle_time_iso=market.settle_time_iso,
                         base_sigma_f=city_base_sigma,
                     )
+                    fair_prob_no = max(0.0, min(1.0, 1.0 - float(fair_prob_yes)))
                     try:
-                        market_price = self._safe_get_price(out.token_id)
+                        market_price_yes = self._safe_get_price(out.yes_token_id)
                     except Exception as exc:
-                        LOGGER.warning("Skip token price unavailable: token=%s err=%s", out.token_id, exc)
+                        LOGGER.warning("Skip YES token price unavailable: token=%s err=%s", out.yes_token_id, exc)
                         continue
                     try:
-                        current_position = self._safe_get_token_position(out.token_id)
+                        market_price_no = self._safe_get_price(out.no_token_id)
                     except Exception as exc:
-                        LOGGER.warning("Skip token position unavailable: token=%s err=%s", out.token_id, exc)
+                        LOGGER.warning("Skip NO token price unavailable: token=%s err=%s", out.no_token_id, exc)
                         continue
-                    edge = fair_prob - market_price
-                    edge_ratio = (fair_prob / market_price) if market_price > 0 else 0.0
-                    stable = self._is_stable_interval(
+                    try:
+                        current_position_yes = self._safe_get_token_position(out.yes_token_id)
+                        current_position_no = self._safe_get_token_position(out.no_token_id)
+                    except Exception as exc:
+                        LOGGER.warning(
+                            "Skip token position unavailable: yes=%s no=%s err=%s",
+                            out.yes_token_id,
+                            out.no_token_id,
+                            exc,
+                        )
+                        continue
+
+                    edge_yes = fair_prob_yes - market_price_yes
+                    edge_no = fair_prob_no - market_price_no
+                    edge_ratio_yes = (fair_prob_yes / market_price_yes) if market_price_yes > 0 else 0.0
+                    edge_ratio_no = (fair_prob_no / market_price_no) if market_price_no > 0 else 0.0
+                    stable_yes = self._is_stable_interval(
                         forecast_max,
                         out.label,
-                        fair_prob,
+                        fair_prob_yes,
                         forecast_unit=forecast_unit_name,
+                    )
+                    # NO 方向稳定性不依赖区间边界，按概率阈值直接判定
+                    stable_no = fair_prob_no >= self.stability_prob_threshold
+
+                    slot_key = f"{market.condition_id}::{out.label}"
+                    scored.append(
+                        {
+                            "city": city_name,
+                            "date": date_key,
+                            "date_label": market.date_label,
+                            "condition_id": market.condition_id,
+                            "question": market.question,
+                            "base_label": out.label,
+                            "label": f"{out.label} (YES)",
+                            "side": "YES",
+                            "slot_key": slot_key,
+                            "token_id": out.yes_token_id,
+                            "opposite_token_id": out.no_token_id,
+                            "forecast_max": round(forecast_max, 2),
+                            "forecast_unit": temp_unit_label,
+                            "market_price": round(market_price_yes, 4),
+                            "fair_prob": round(fair_prob_yes, 4),
+                            "edge": round(edge_yes, 4),
+                            "edge_ratio": round(edge_ratio_yes, 4),
+                            "model_source": self.current_model_source,
+                            "stable": stable_yes,
+                            "current_position_shares": round(current_position_yes, 4),
+                            "entry_price": round(
+                                float(self.positions_cost.get(out.yes_token_id, {}).get("avg_price", 0.0)), 4
+                            ),
+                            "unrealized_pnl": round(
+                                (
+                                    (float(market_price_yes) - float(self.positions_cost.get(out.yes_token_id, {}).get("avg_price", 0.0)))
+                                    / float(self.positions_cost.get(out.yes_token_id, {}).get("avg_price", 0.0))
+                                )
+                                if float(self.positions_cost.get(out.yes_token_id, {}).get("avg_price", 0.0)) > 0
+                                else 0.0,
+                                4,
+                            ),
+                            "exit_reason": "",
+                            "base_sigma": round(city_base_sigma, 4),
+                        }
                     )
                     scored.append(
                         {
@@ -2809,26 +2999,30 @@ class PolymarketWeatherMaster:
                             "date_label": market.date_label,
                             "condition_id": market.condition_id,
                             "question": market.question,
-                            "label": out.label,
-                            "token_id": out.token_id,
+                            "base_label": out.label,
+                            "label": f"{out.label} (NO)",
+                            "side": "NO",
+                            "slot_key": slot_key,
+                            "token_id": out.no_token_id,
+                            "opposite_token_id": out.yes_token_id,
                             "forecast_max": round(forecast_max, 2),
                             "forecast_unit": temp_unit_label,
-                            "market_price": round(market_price, 4),
-                            "fair_prob": round(fair_prob, 4),
-                            "edge": round(edge, 4),
-                            "edge_ratio": round(edge_ratio, 4),
+                            "market_price": round(market_price_no, 4),
+                            "fair_prob": round(fair_prob_no, 4),
+                            "edge": round(edge_no, 4),
+                            "edge_ratio": round(edge_ratio_no, 4),
                             "model_source": self.current_model_source,
-                            "stable": stable,
-                            "current_position_shares": round(current_position, 4),
+                            "stable": stable_no,
+                            "current_position_shares": round(current_position_no, 4),
                             "entry_price": round(
-                                float(self.positions_cost.get(out.token_id, {}).get("avg_price", 0.0)), 4
+                                float(self.positions_cost.get(out.no_token_id, {}).get("avg_price", 0.0)), 4
                             ),
                             "unrealized_pnl": round(
                                 (
-                                    (float(market_price) - float(self.positions_cost.get(out.token_id, {}).get("avg_price", 0.0)))
-                                    / float(self.positions_cost.get(out.token_id, {}).get("avg_price", 0.0))
+                                    (float(market_price_no) - float(self.positions_cost.get(out.no_token_id, {}).get("avg_price", 0.0)))
+                                    / float(self.positions_cost.get(out.no_token_id, {}).get("avg_price", 0.0))
                                 )
-                                if float(self.positions_cost.get(out.token_id, {}).get("avg_price", 0.0)) > 0
+                                if float(self.positions_cost.get(out.no_token_id, {}).get("avg_price", 0.0)) > 0
                                 else 0.0,
                                 4,
                             ),
@@ -2836,7 +3030,35 @@ class PolymarketWeatherMaster:
                             "base_sigma": round(city_base_sigma, 4),
                         }
                     )
-                    exposure_by_token[out.token_id] = float(market_price) * float(current_position)
+                    diagnostics_rows.append(
+                        {
+                            "city": city_name,
+                            "date": date_key,
+                            "date_label": market.date_label,
+                            "condition_id": market.condition_id,
+                            "base_label": out.label,
+                            "forecast_max": round(float(forecast_max), 4),
+                            "forecast_unit": temp_unit_label,
+                            "yes": {
+                                "token_id": out.yes_token_id,
+                                "market_price": round(float(market_price_yes), 6),
+                                "fair_prob": round(float(fair_prob_yes), 6),
+                                "edge": round(float(edge_yes), 6),
+                                "edge_ratio": round(float(edge_ratio_yes), 6),
+                                "position_shares": round(float(current_position_yes), 6),
+                            },
+                            "no": {
+                                "token_id": out.no_token_id,
+                                "market_price": round(float(market_price_no), 6),
+                                "fair_prob": round(float(fair_prob_no), 6),
+                                "edge": round(float(edge_no), 6),
+                                "edge_ratio": round(float(edge_ratio_no), 6),
+                                "position_shares": round(float(current_position_no), 6),
+                            },
+                        }
+                    )
+                    exposure_by_token[out.yes_token_id] = float(market_price_yes) * float(current_position_yes)
+                    exposure_by_token[out.no_token_id] = float(market_price_no) * float(current_position_no)
 
                 # 先做卖出决策（止盈/止损/模型反转），再评估是否买入
                 exit_actions = self.check_and_exit_positions(city_name, market, scored)
@@ -2850,7 +3072,7 @@ class PolymarketWeatherMaster:
                     ]
                     LOGGER.info("ProbMap [%s %s] %s", city_name, market.date_label, " || ".join(prob_map_parts))
 
-                scored.sort(key=lambda x: x["fair_prob"], reverse=True)
+                scored.sort(key=lambda x: x["edge"], reverse=True)
                 best = scored[0] if scored else None
                 if not best:
                     continue
@@ -2880,6 +3102,13 @@ class PolymarketWeatherMaster:
                 other_condition_position = max(
                     0.0, total_condition_position - float(best["current_position_shares"])
                 )
+                opposite_slot_position = sum(
+                    float(x.get("current_position_shares", 0.0))
+                    for x in scored
+                    if str(x.get("slot_key", "")) == str(best.get("slot_key", ""))
+                    and str(x.get("side", "")) != str(best.get("side", ""))
+                )
+                can_add_slot_direction = opposite_slot_position <= 1e-8
                 can_add_single_condition = (
                     (not self.single_outcome_per_condition)
                     or float(best["current_position_shares"]) > 0
@@ -2912,6 +3141,7 @@ class PolymarketWeatherMaster:
                     and edge_ratio_ok
                     and can_add_position
                     and can_add_condition_total
+                    and can_add_slot_direction
                     and can_add_single_condition
                     and can_trade_amount
                     and settle_time_ok
@@ -2932,8 +3162,10 @@ class PolymarketWeatherMaster:
                 best["can_add_position"] = can_add_position
                 best["total_condition_position_shares"] = round(total_condition_position, 4)
                 best["other_condition_position_shares"] = round(other_condition_position, 4)
+                best["opposite_slot_position_shares"] = round(opposite_slot_position, 4)
                 best["projected_total_condition_position_shares"] = round(projected_total_condition_position, 4)
                 best["can_add_condition_total"] = can_add_condition_total
+                best["can_add_slot_direction"] = can_add_slot_direction
                 best["can_add_single_condition"] = can_add_single_condition
                 best["hours_to_settle"] = (
                     round(hours_to_settle, 2) if isinstance(hours_to_settle, (int, float)) else ""
@@ -2958,6 +3190,8 @@ class PolymarketWeatherMaster:
                     best["hold_reason"] = "token_position_limit"
                 elif not can_add_condition_total:
                     best["hold_reason"] = "condition_position_limit"
+                elif not can_add_slot_direction:
+                    best["hold_reason"] = "slot_direction_conflict"
                 elif not can_add_single_condition:
                     best["hold_reason"] = "condition_locked_other_outcome"
                 elif str(best["token_id"]) in exited_tokens:
@@ -3032,6 +3266,17 @@ class PolymarketWeatherMaster:
                             LOGGER.warning("Buy failed and downgraded to HOLD: %s", exc)
 
             actions.extend(self._build_discovery_debug_rows())
+            if self.write_static_report:
+                self._write_static_report(
+                    actions,
+                    write_history=False,
+                    progress={
+                        "stage": "city_done",
+                        "city": city_name,
+                        "city_index": city_idx,
+                        "total_cities": total_cities,
+                    },
+                )
 
         # 对策略覆盖范围之外的持仓做止盈/止损，避免仓位长期“无人管理”
         unmanaged_exit_actions = self.check_and_exit_unmanaged_positions(covered_token_ids, live_positions)
@@ -3040,6 +3285,16 @@ class PolymarketWeatherMaster:
             sold_tokens = {str(x.get("token_id") or "") for x in actions if str(x.get("signal") or "") == "REDUCE"}
             standby_actions = self._standby_flatten_live_positions(live_positions, skip_tokens=sold_tokens)
             actions.extend(standby_actions)
+
+        self._write_diagnostics(
+            {
+                "generated_at": datetime.now(self.NYC_TZ).strftime("%Y-%m-%d %H:%M:%S %Z"),
+                "generated_at_iso": datetime.now(self.NYC_TZ).isoformat(),
+                "mode": "yes_no_dual_side",
+                "rows": diagnostics_rows,
+                "signal_summary": self._signal_summary(actions),
+            }
+        )
 
         if self.write_static_report:
             self._write_static_report(actions)
@@ -3077,6 +3332,9 @@ if __name__ == "__main__":
     )
     # 自动读取 .env，确保 watchdog/双击启动时也能拿到签名参数
     load_env_file(".env")
+    if not acquire_single_instance_lock():
+        LOGGER.error("Detected another Quantify.py instance. Exit this process.")
+        raise SystemExit(0)
 
     # 从环境变量读取私钥，避免明文写入代码库
     PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "").strip()

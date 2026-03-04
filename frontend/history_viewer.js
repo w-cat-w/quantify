@@ -34,10 +34,13 @@ const rowsInfo = document.getElementById("rowsInfo");
 const tbody = document.getElementById("tbody");
 const meta = document.getElementById("meta");
 const summaryEl = document.getElementById("summary");
+const diagTbody = document.getElementById("diagTbody");
+const diagMeta = document.getElementById("diagMeta");
 
 let index = [];
 let currentActions = [];
 let filteredRows = [];
+let diagnosticsRows = [];
 let currentPage = 1;
 
 function shortId(v, left = 8, right = 6) {
@@ -90,6 +93,87 @@ function renderSummaryCards(rs) {
     <div class="metric"><div class="k">发现跳过</div><div class="v">${ds.SKIP ?? 0}</div></div>
     <div class="metric"><div class="k">可交易信号</div><div class="v">${tradable}</div></div>
   `;
+}
+
+function fmtNum(v, digits = 3) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "—";
+  return n.toFixed(digits);
+}
+
+function renderDiagnosticsTable() {
+  if (!Array.isArray(diagnosticsRows) || diagnosticsRows.length === 0) {
+    diagMeta.textContent = "暂无 diagnostics.json 数据（先运行机器人一轮）。";
+    diagTbody.innerHTML =
+      '<tr><td colspan="7"><div class="empty">没有诊断数据可展示。</div></td></tr>';
+    return;
+  }
+
+  const selectedDate = String(dateSel.value || "").trim();
+  const keyword = String(qEl.value || "").trim().toLowerCase();
+  const currentCities = new Set(
+    currentActions.map((it) => String(it.city || "").trim()).filter(Boolean),
+  );
+
+  let rows = diagnosticsRows.filter((it) => {
+    const okDate = !selectedDate || String(it.date || "") === selectedDate;
+    const okCity = currentCities.size === 0 || currentCities.has(String(it.city || "").trim());
+    const hay = [
+      it.city,
+      it.date,
+      it.date_label,
+      it.base_label,
+      it.condition_id,
+      it?.yes?.token_id,
+      it?.no?.token_id,
+    ]
+      .map((v) => String(v || "").toLowerCase())
+      .join(" ");
+    const okQuery = !keyword || hay.includes(keyword);
+    return okDate && okCity && okQuery;
+  });
+
+  rows.sort((a, b) => {
+    const ae = Math.max(Number(a?.yes?.edge || -999), Number(a?.no?.edge || -999));
+    const be = Math.max(Number(b?.yes?.edge || -999), Number(b?.no?.edge || -999));
+    return be - ae;
+  });
+
+  rows = rows.slice(0, 120);
+  diagMeta.textContent = `诊断条目 ${rows.length} 条（按优势值从高到低，已和当前筛选联动）`;
+
+  if (rows.length === 0) {
+    diagTbody.innerHTML =
+      '<tr><td colspan="7"><div class="empty">当前筛选条件下没有诊断数据。</div></td></tr>';
+    return;
+  }
+
+  diagTbody.innerHTML = rows
+    .map((it) => {
+      const yesEdge = Number(it?.yes?.edge || 0);
+      const noEdge = Number(it?.no?.edge || 0);
+      const bestSide = yesEdge >= noEdge ? "YES" : "NO";
+      const bestEdge = yesEdge >= noEdge ? yesEdge : noEdge;
+      const sideClass = bestEdge > 0 ? "side-win" : "side-neutral";
+      return `
+        <tr>
+          <td>${it.city || "—"}</td>
+          <td>${it.date_label || "—"}<div class="small">${it.date || ""}</div></td>
+          <td>${it.base_label || "—"}</td>
+          <td>
+            价=${fmtNum(it?.yes?.market_price)} | 概=${pct(it?.yes?.fair_prob)}<br/>
+            Edge=${fmtNum(it?.yes?.edge)}
+          </td>
+          <td>
+            价=${fmtNum(it?.no?.market_price)} | 概=${pct(it?.no?.fair_prob)}<br/>
+            Edge=${fmtNum(it?.no?.edge)}
+          </td>
+          <td><span class="side-tag ${sideClass}">${bestSide} (${fmtNum(bestEdge)})</span></td>
+          <td>${fmtNum(it.forecast_max, 2)} ${it.forecast_unit || ""}</td>
+        </tr>
+      `;
+    })
+    .join("");
 }
 
 function rowHtml(it) {
@@ -183,6 +267,7 @@ function renderTable() {
     return;
   }
   tbody.innerHTML = rows.map(rowHtml).join("");
+  renderDiagnosticsTable();
 }
 
 async function loadRun() {
@@ -223,6 +308,15 @@ function rebuildRunSelector() {
 
 async function boot() {
   const idx = await fetchJson("../reports/history_index.json");
+  try {
+    const diag = await fetchJson("../reports/diagnostics.json");
+    diagnosticsRows = Array.isArray(diag.rows) ? diag.rows : [];
+    if (diag.generated_at) {
+      diagMeta.textContent = `诊断快照时间：${diag.generated_at}，共 ${diagnosticsRows.length} 条。`;
+    }
+  } catch (err) {
+    diagnosticsRows = [];
+  }
   index = Array.isArray(idx.history) ? idx.history : [];
   const days = [...new Set(index.map((x) => x.date_key).filter(Boolean))];
   dateSel.innerHTML =

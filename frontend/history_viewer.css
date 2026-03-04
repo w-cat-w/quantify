@@ -77,6 +77,17 @@ select:focus, input:focus {
 }
 
 .meta { font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+.diag-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 10px;
+}
+.diag-head h2 {
+  margin: 0 0 4px;
+  font-size: 18px;
+  color: #1a3d6b;
+}
 
 .cards {
   display: grid;
@@ -168,6 +179,25 @@ tbody tr:hover { background: #f7fbff; }
   background: #fafcff;
   border: 1px dashed #d3dfed;
   border-radius: 12px;
+}
+.side-tag {
+  display: inline-block;
+  min-width: 104px;
+  text-align: center;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 700;
+}
+.side-win {
+  background: #e6f8ef;
+  color: #0b7a4e;
+  border: 1px solid #bde9d2;
+}
+.side-neutral {
+  background: #f6f8fc;
+  color: #556b8c;
+  border: 1px solid #dce6f2;
 }
 
 @media (max-width: 1040px) {

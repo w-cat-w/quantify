@@ -45,6 +45,31 @@
     </section>
 
     <section class="panel">
+      <div class="diag-head">
+        <div>
+          <h2>YES / NO 双向对比</h2>
+          <div class="small" id="diagMeta">用于查看同一区间两个方向的定价差、模型概率和优势值。</div>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>城市</th>
+              <th>日期</th>
+              <th>区间</th>
+              <th>YES（价格/公允/Edge）</th>
+              <th>NO（价格/公允/Edge）</th>
+              <th>推荐方向</th>
+              <th>预测最高温</th>
+            </tr>
+          </thead>
+          <tbody id="diagTbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
       <div class="toolbar">
         <div id="rowsInfo" class="small"></div>
         <div class="pager">
