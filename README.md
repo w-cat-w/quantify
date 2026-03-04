@@ -108,5 +108,5 @@ bot = PolymarketWeatherMaster(
 
 本仓库代码仅供学术研究和技术交流使用，不构成任何投资或财务建议。
 加密货币和预测市场具有极高的波动性和归零风险。在真实环境运行本机器人会导致您钱包中的真实 USDC 发生转移。
-使用者应自行承担因软件 Bug、网络延迟、API 变更或策略失效导致的全部财务损失。Do not trade with money you cannot afford to lose.
+使用者应自行承担因软件 Bug、网络延迟、API 变更或策略失效等导致的全部财务损失。
 
