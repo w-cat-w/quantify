@@ -1,144 +1,89 @@
-# Polymarket Weather Master
+# 🌩️ Polymarket Weather Quant Bot (气象预测量化交易机器人)
 
-基于 `py-clob-client + requests` 的 Polymarket 气象量化交易机器人。  
-当前版本已支持多城市、多天气源、YES/NO 双向交易、持仓成本跟踪、止盈止损、历史回放与诊断面板。
+一个专为 Polymarket 二元气象市场（天气最高温预测）设计的高级自动化量化交易机器人。
 
-代码主入口：`Quantify.py`（核心类：`PolymarketWeatherMaster`）
+本项目不仅实现了与 Polymarket CLOB API 的全自动交互，更内置了机构级的概率建模、基于凯利公式的资金管理，以及极其严苛的风控退出机制。它通过多源气象数据融合寻找市场的“错误定价（Edge）”，在确保正期望值（Positive EV）的前提下执行无人值守的自动化套利。
 
-## 功能概览
+## ✨ 核心特性 (Core Features)
 
-- 多城市扫描：默认覆盖 New York、Miami、Chicago、Atlanta、Toronto、London、Paris、Brussels、Vienna、Seoul、Tokyo、Dallas、Ankara、Buenos Aires、Wellington、Sydney、Seattle、Sao Paulo、Munich、Lucknow。
-- 动态市场发现：基于 Gamma `/events` 搜索与评分，自动锁定 T0/T1/T2（纽约时区）目标天气市场。
-- YES/NO 双向交易：同一区间同时评估 YES 与 NO 的 `fair_prob/price/edge`，按 Edge 统一排序决策。
-- 多源天气融合：优先尝试 Open-Meteo 模型（含 HRRR/GFS 相关），并融合 NWS、METAR、fallback 源。
-- 风控体系：最小概率/价格过滤、相对优势过滤、仓位上限、全局暴露上限、日内亏损熔断 Standby。
-- 持仓管理：加权成本、浮盈亏、止盈/止损/模型反转平仓、临近结算防守减仓。
-- 报告系统：每轮输出 `latest_actions.json`、历史快照、`diagnostics.json`，并提供前端回放页面。
-- 单实例保护：文件锁防止多开同一脚本。
+### 1. 📡 多气象源融合 (Alpha Generation)
+- **多模型并行**：集成 Open-Meteo (HRRR, GFS Seamless, Best Match)、美国国家气象局 (NWS) 以及实时航空气象 (METAR) 数据。
+- **智能置信度加权**：根据预测时间跨度（Horizon）、模型历史可靠度以及各数据源之间的分歧度（Disagreement Index），动态计算加权预测值和置信度。
 
-## 核心流程
+### 2. 🧮 精确的概率建模 (Probabilistic Modeling)
+- **动态标准差 (Dynamic Sigma)**：随着结算时间的临近，自动收窄温度分布预测的标准差 $\sigma$。
+- **精准对齐结算规则**：完美适配 Polymarket 基于 Wunderground 的“整数结算”与“0.5 进位”规则。算法将物理预测值映射到 `[L-0.5, H+0.5)` 区间进行正态分布 CDF 积分，捕捉盘口隐藏的真实胜率。
 
-1. 按纽约时区计算交易日期（T0/T1/T2）并构造日期标签（如 `March 4`）。
-2. 先做市场探测（Discovery），找到可交易 condition 与 outcome token。
-3. 获取城市未来 3 天最高温预测（多数据源融合）。
-4. 对每个区间计算：
-   - `fair_prob_yes` 与 `fair_prob_no = 1 - fair_prob_yes`
-   - 市场价格、绝对 edge、相对 edge（edge_ratio）
-5. 在风控条件满足时执行交易（BUY/HOLD/REDUCE），并记录成本、日志、历史与诊断。
+### 3. ⚔️ 双向优势驱动 (Edge-Driven Dual-Side Trading)
+- **YES / NO 全域扫描**：不再盲目押注单一方向。系统同时计算气温落入某区间（YES）和不落入某区间（NO）的公平概率。
+- **严格的出手门槛**：仅在“模型概率 - 盘口价格 > 预设阈值（如 15% Edge）”时才触发交易指令。
+- **过滤“伪高胜率”**：内置最高价限制（如拒绝买入价格高于 50¢ 的 NO Token），彻底杜绝盈亏比极度失衡的“捡硬币”陷阱。
 
-## 默认交易与风控参数（当前代码）
+### 4. 🛡️ 极端风控与资金管理 (Risk Management & Execution)
+- **Fractional Kelly 仓位管理**：基于边际优势（Edge）和凯利公式动态计算单笔下注金额，并受限于全盘暴露上限。
+- **移动止损 (Trailing Stop)**：当仓位获得显著浮盈（如 +30%）后，自动上移止损线。一旦回撤 10% 立即清仓，彻底锁定利润。
+- **微小仓位合成对冲 (Synthetic Close)**：面对 Polymarket $1.00 的最低市价单硬限制，当亏损仓位价值跌破 $1.00 无法直接卖出时，机器人会自动买入对侧 Token（如持有 YES 则买入 NO）形成完美对冲，物理锁死残余风险。
+- **流动性保护**：下单前进行买卖价差（Spread）检测，拒绝在高滑点盘口执行 FOK 订单。
 
-- `bankroll_fraction=0.18`
-- `edge_threshold=0.10`
-- `min_fair_prob=0.15`
-- `min_market_price=0.10`
-- `max_market_price=0.70`
-- `min_edge_ratio=1.25`
-- `min_trade_usdc=1.0`（受交易所最小买入约束）
-- `max_trade_usdc=2.0`
-- `total_exposure_limit=0.80`
-- `take_profit_ratio=1.12`
-- `stop_loss_ratio=0.96`
-- `daily_loss_limit_ratio=0.30`（触发 Standby）
-- `min_hours_to_settlement_for_entry=12.0`
-- `single_outcome_per_condition=True`
+---
 
-说明：这些参数都在 `Quantify.py` 构造函数中，可按实盘反馈继续调优。
+## ⚙️ 系统架构 (Architecture)
 
-## 环境准备
 
-### 1) 安装依赖
 
-```powershell
-.\.venv\Scripts\pip.exe install py-clob-client requests pytz
-```
+机器人采用轮询架构（`run_forever`），主循环流程如下：
+1. **Market Discovery**: 扫描 Gamma API，动态发现特定城市 T0/T1/T2 的天气区间市场。
+2. **Forecast Fetching**: 并发拉取各大气象局 API，融合计算未来最高温 $\mu$ 与 置信度。
+3. **Probability & Edge Engine**: 针对每个 Outcome (YES/NO) 计算 Fair Probability，并与 CLOB 实时盘口价格对比，得出 Edge。
+4. **Position Sizing & Safety Check**: 凯利公式计算底仓，结合总暴露上限、价差过滤、日内亏损熔断（Standby 模式）等风控指标得出最终下单量。
+5. **Execution & Exit**: 评估现有持仓，执行止盈/移动止损/合成平仓；向符合要求的新信号发射 FOK 市价单。
+6. **Reporting**: 导出高频诊断日志（`diagnostics.json`）与历史交易快照。
 
-### 2) 配置私钥与账户参数
+---
 
-程序启动时会自动读取项目根目录 `.env`（若存在），并以环境变量为准。
+## 🚀 安装与运行 (Installation & Usage)
 
-必填：
+### 环境依赖
+- Python 3.9+
+- [py-clob-client](https://github.com/Polymarket/py-clob-client) (Polymarket 官方 Python SDK)
+- `requests`, `pytz`
 
-- `POLYMARKET_PRIVATE_KEY=0x...`（64 位十六进制私钥）
+### 安装步骤
+1. 克隆本仓库：
+   ```bash
+   git clone [https://github.com/YOUR_USERNAME/polymarket-weather-quant.git](https://github.com/YOUR_USERNAME/polymarket-weather-quant.git)
+   cd polymarket-weather-quant
+安装依赖：
 
-可选（代理钱包/邮箱钱包常用）：
+Bash
+pip install -r requirements.txt
+配置环境变量：
+复制 .env.example 为 .env 并填入你的 Polymarket 钱包私钥。
 
-- `POLYMARKET_SIGNATURE_TYPE=0|1|2`
-- `POLYMARKET_FUNDER=0x...`
+Ini, TOML
+POLYMARKET_PRIVATE_KEY=0xYourPrivateKeyHere
+POLYMARKET_SIGNATURE_TYPE=0  # 0 for EOA, 1 or 2 for Proxy Wallets
+# POLY_DRY_RUN=true          # 开启此项则只打印交易信号，不真实下单
+启动机器人
+Bash
+python Quantify.py
+📊 核心配置参数 (Configuration Tuning)
+在 Quantify.py 底部可调整机器人的交易偏好：
 
-循环配置（可选）：
+Python
+bot = PolymarketWeatherMaster(
+    private_key=PRIVATE_KEY,
+    investment_usdc=10.0,           # 基准资金
+    edge_threshold=0.15,            # 最小优势阈值 (15%)
+    min_fair_prob=0.20,             # 最低公平概率 (过滤极小概率事件)
+    max_trade_usdc=3.0,             # 单笔最高预算
+    total_exposure_limit=0.80,      # 全局资金暴露上限 (80%)
+    enable_daily_loss_standby=True, # 开启日内亏损熔断保护
+    dry_run=False                   # 是否为模拟沙盒模式
+)
+⚠️ 免责声明 (Disclaimer)
+本仓库代码仅供学术研究和技术交流使用，不构成任何投资或财务建议。
+加密货币和预测市场具有极高的波动性和归零风险。在真实环境运行本机器人会导致您钱包中的真实 USDC 发生转移。
+使用者应自行承担因软件 Bug、网络延迟、API 变更或策略失效导致的全部财务损失。Do not trade with money you cannot afford to lose.
 
-- `POLY_LOOP_INTERVAL_SECONDS=300`（默认 5 分钟）
-- `POLY_HEARTBEAT_SECONDS=3600`
-- `POLY_DRY_RUN=true|false`
-
-PowerShell 临时设置示例：
-
-```powershell
-$env:POLYMARKET_PRIVATE_KEY="0x你的私钥"
-$env:POLYMARKET_SIGNATURE_TYPE="1"
-$env:POLYMARKET_FUNDER="0x你的funder地址"
-```
-
-## 运行方式
-
-### 方式 A：直接运行主脚本
-
-```powershell
-.\.venv\Scripts\python.exe .\Quantify.py
-```
-
-### 方式 B：看门狗模式（自动重启）
-
-```powershell
-.\start_bot_watchdog.bat
-```
-
-## 输出文件与前端回放
-
-每轮执行会写入：
-
-- `reports/latest_actions.json`：最新一轮策略结果
-- `reports/history/*.json`：历史快照
-- `reports/history_index.json`：历史索引（倒序）
-- `reports/diagnostics.json`：最新一轮诊断数据（含 YES/NO 双向对比）
-- `reports/positions_cost.json`：持仓成本缓存
-- `reports/daily_realized_pnl.json`：日内已实现盈亏
-
-前端页面：
-
-- `frontend/history_viewer.html`
-
-启动静态服务并访问：
-
-```powershell
-.\.venv\Scripts\python.exe -m http.server 8000
-```
-
-- `http://127.0.0.1:8000/frontend/history_viewer.html`
-
-页面支持：
-
-- 历史批次筛选
-- BUY/HOLD/REDUCE 回放
-- Discovery 发现结果展示
-- YES/NO 同区间价格、公允概率、Edge 对比与推荐方向
-
-## 常见问题
-
-1. 看起来“没下单”
-- 先看 `reports/latest_actions.json` 的 `hold_reason`。
-- 常见原因：`SETTLE_TOO_NEAR`、`PRICE_TOO_LOW`、`PROB_TOO_LOW`、`total_exposure_limit`、`daily_loss_standby_active`。
-
-2. 为什么有两个 python 进程
-- 可能是父子进程关系，不一定是双实例。
-- 以单实例锁文件 `reports/quantify_bot.lock` 为准；若重复启动，会被拦截退出。
-
-3. 日志有 `POST /auth/api-key 400` 但随后恢复
-- 常见于凭证刷新流程，不一定是致命错误；关注后续是否有 `CLOB API credentials refreshed`。
-
-## 安全说明
-
-- 私钥不要提交到仓库。
-- 建议仅用小额资金做参数验证。
-- 本项目仅作技术研究与自动化示例，不构成投资建议。
+Created by [Your Name/Handle] - Pull Requests are welcome!
