@@ -1,4 +1,4 @@
-﻿import json
+import json
 import logging
 import math
 import os
@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pytz
 import requests
@@ -359,6 +359,7 @@ class PolymarketWeatherMaster:
         min_market_price: float = 0.10,
         max_market_price: float = 0.70,
         min_edge_ratio: float = 1.25,
+        min_confidence_score: float = 0.45,
         temp_sigma_f: float = 2.0,
         stability_prob_threshold: float = 0.70,
         boundary_buffer_f: float = 0.8,
@@ -388,9 +389,17 @@ class PolymarketWeatherMaster:
         dust_notional_threshold_usdc: float = 1.0,
         standby_force_exit_min_notional: float = 0.2,
         sell_limit_discount: float = 0.01,
+        enable_synthetic_close_dust: bool = True,
+        synthetic_close_min_notional_usdc: float = 1.0,
+        synthetic_close_max_notional_usdc: float = 1.0,
+        model_shift_exit_delta: float = 0.15,
         total_exposure_limit: float = 0.80,
         positions_cost_file: str = "positions_cost.json",
+        opposite_token_map_file: str = "opposite_token_map.json",
+        synthetic_hedge_state_file: str = "synthetic_hedge_state.json",
         daily_realized_pnl_file: str = "daily_realized_pnl.json",
+        fair_prob_state_file: str = "fair_prob_state.json",
+        source_reliability_file: str = "source_reliability.json",
         report_dir: str = "reports",
         write_static_report: bool = True,
         write_history_report: bool = True,
@@ -419,6 +428,8 @@ class PolymarketWeatherMaster:
         self.max_market_price = max(self.min_market_price, min(1.0, max_market_price))
         # 最低相对优势倍数 fair_prob/market_price
         self.min_edge_ratio = max(1.0, min_edge_ratio)
+        # 最低置信度，低于该值不新开仓
+        self.min_confidence_score = min(1.0, max(0.0, float(min_confidence_score)))
         # 温度预测分布的标准差（华氏度）
         self.temp_sigma_f = temp_sigma_f
         # “稳定落入区间”的最小概率阈值
@@ -467,6 +478,15 @@ class PolymarketWeatherMaster:
         self.pre_settle_reduce_fraction = min(1.0, max(0.1, float(pre_settle_reduce_fraction)))
         # 卖出限价相对买一价折让比例（默认 1%）
         self.sell_limit_discount = min(0.05, max(0.001, sell_limit_discount))
+        # Dust 仓位合成平仓（对侧对冲）开关与名义限额
+        self.enable_synthetic_close_dust = bool(enable_synthetic_close_dust)
+        self.synthetic_close_min_notional_usdc = max(1.0, float(synthetic_close_min_notional_usdc))
+        self.synthetic_close_max_notional_usdc = max(
+            self.synthetic_close_min_notional_usdc,
+            float(synthetic_close_max_notional_usdc),
+        )
+        # 模型突变平仓阈值：当公平概率较上一轮下降超过该值，且 edge<=0 时平仓
+        self.model_shift_exit_delta = min(0.9, max(0.01, float(model_shift_exit_delta)))
         # Dust 仓位定义阈值（用于更激进卖出）
         self.dust_notional_threshold_usdc = max(0.05, float(dust_notional_threshold_usdc))
         # Standby 平仓最小名义价值（低于该值可能为链上尘埃仓）
@@ -515,10 +535,26 @@ class PolymarketWeatherMaster:
         self.positions_cost_file = self.report_dir / positions_cost_file
         self.positions_cost: Dict[str, Dict[str, float]] = {}
         self._load_positions_cost()
+        # token 对侧映射（YES<->NO），用于 dust 合成平仓
+        self.opposite_token_map_file = self.report_dir / opposite_token_map_file
+        self.opposite_token_map: Dict[str, str] = {}
+        self._load_opposite_token_map()
+        # 合成平仓对冲状态：记录每个 token 已对冲份额，避免重复无效操作
+        self.synthetic_hedge_state_file = self.report_dir / synthetic_hedge_state_file
+        self.synthetic_hedge_state: Dict[str, float] = {}
+        self._load_synthetic_hedge_state()
         # 日内已实现盈亏，结构：{YYYY-MM-DD: pnl_usdc}
         self.daily_realized_pnl_file = self.report_dir / daily_realized_pnl_file
         self.daily_realized_pnl: Dict[str, float] = {}
         self._load_daily_realized_pnl()
+        # token 公平概率状态缓存（用于检测模型概率突变）
+        self.fair_prob_state_file = self.report_dir / fair_prob_state_file
+        self.fair_prob_state: Dict[str, float] = {}
+        self._load_fair_prob_state()
+        # 多源可靠度状态缓存（0~1），用于融合动态加权
+        self.source_reliability_file = self.report_dir / source_reliability_file
+        self.source_reliability: Dict[str, float] = {}
+        self._load_source_reliability()
         # 启动时回填一次真实持仓，避免脚本重启后看不到历史仓位成本
         self._bootstrap_positions_cost_from_live_positions()
         # Open-Meteo 预测模型选择缓存（优先 HRRR，否则 gfs_seamless）
@@ -578,6 +614,89 @@ class PolymarketWeatherMaster:
         except Exception as exc:
             LOGGER.warning("Failed to save positions cost file: %s", exc)
 
+    def _load_opposite_token_map(self) -> None:
+        """加载 token 对侧映射（YES<->NO）。"""
+        try:
+            if not self.opposite_token_map_file.exists():
+                self.opposite_token_map = {}
+                return
+            raw = json.loads(self.opposite_token_map_file.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                self.opposite_token_map = {}
+                return
+            cleaned: Dict[str, str] = {}
+            for k, v in raw.items():
+                tk = str(k or "").strip()
+                tv = str(v or "").strip()
+                if tk and tv and tk != tv:
+                    cleaned[tk] = tv
+            self.opposite_token_map = cleaned
+        except Exception as exc:
+            LOGGER.warning("Failed to load opposite token map: %s", exc)
+            self.opposite_token_map = {}
+
+    def _save_opposite_token_map(self) -> None:
+        """持久化 token 对侧映射。"""
+        try:
+            self.report_dir.mkdir(parents=True, exist_ok=True)
+            self.opposite_token_map_file.write_text(
+                json.dumps(self.opposite_token_map, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            LOGGER.warning("Failed to save opposite token map: %s", exc)
+
+    def _load_synthetic_hedge_state(self) -> None:
+        """加载合成平仓对冲份额状态。"""
+        try:
+            if not self.synthetic_hedge_state_file.exists():
+                self.synthetic_hedge_state = {}
+                return
+            raw = json.loads(self.synthetic_hedge_state_file.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                self.synthetic_hedge_state = {}
+                return
+            cleaned: Dict[str, float] = {}
+            for k, v in raw.items():
+                try:
+                    token_id = str(k or "").strip()
+                    fv = float(v)
+                    if token_id and fv > 0:
+                        cleaned[token_id] = fv
+                except Exception:
+                    continue
+            self.synthetic_hedge_state = cleaned
+        except Exception as exc:
+            LOGGER.warning("Failed to load synthetic hedge state: %s", exc)
+            self.synthetic_hedge_state = {}
+
+    def _save_synthetic_hedge_state(self) -> None:
+        """持久化合成平仓对冲份额状态。"""
+        try:
+            self.report_dir.mkdir(parents=True, exist_ok=True)
+            self.synthetic_hedge_state_file.write_text(
+                json.dumps(self.synthetic_hedge_state, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            LOGGER.warning("Failed to save synthetic hedge state: %s", exc)
+
+    def _effective_unhedged_shares(self, token_id: str, total_shares: float) -> float:
+        """返回扣除已合成对冲后的未对冲份额。"""
+        hedged = float(self.synthetic_hedge_state.get(str(token_id), 0.0) or 0.0)
+        return max(0.0, float(total_shares) - hedged)
+
+    def _register_synthetic_hedge(self, token_id: str, hedged_shares: float) -> None:
+        """累加 token 的已对冲份额。"""
+        if hedged_shares <= 0:
+            return
+        tk = str(token_id or "")
+        if not tk:
+            return
+        prev = float(self.synthetic_hedge_state.get(tk, 0.0) or 0.0)
+        self.synthetic_hedge_state[tk] = max(0.0, prev + float(hedged_shares))
+        self._save_synthetic_hedge_state()
+
     def _load_daily_realized_pnl(self) -> None:
         """从本地 JSON 读取按日期累计的已实现盈亏。"""
         try:
@@ -598,6 +717,73 @@ class PolymarketWeatherMaster:
         except Exception as exc:
             LOGGER.warning("Failed to load daily realized pnl file: %s", exc)
             self.daily_realized_pnl = {}
+
+    def _load_fair_prob_state(self) -> None:
+        """加载 token 公平概率状态缓存。"""
+        try:
+            if not self.fair_prob_state_file.exists():
+                self.fair_prob_state = {}
+                return
+            raw = json.loads(self.fair_prob_state_file.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                self.fair_prob_state = {}
+                return
+            cleaned: Dict[str, float] = {}
+            for k, v in raw.items():
+                try:
+                    fv = float(v)
+                    if 0.0 <= fv <= 1.0:
+                        cleaned[str(k)] = fv
+                except Exception:
+                    continue
+            self.fair_prob_state = cleaned
+        except Exception as exc:
+            LOGGER.warning("Failed to load fair prob state file: %s", exc)
+            self.fair_prob_state = {}
+
+    def _save_fair_prob_state(self) -> None:
+        """保存 token 公平概率状态缓存。"""
+        try:
+            self.report_dir.mkdir(parents=True, exist_ok=True)
+            self.fair_prob_state_file.write_text(
+                json.dumps(self.fair_prob_state, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            LOGGER.warning("Failed to save fair prob state file: %s", exc)
+
+    def _load_source_reliability(self) -> None:
+        """加载多源可靠度缓存。"""
+        try:
+            if not self.source_reliability_file.exists():
+                self.source_reliability = {}
+                return
+            raw = json.loads(self.source_reliability_file.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                self.source_reliability = {}
+                return
+            cleaned: Dict[str, float] = {}
+            for k, v in raw.items():
+                try:
+                    rv = float(v)
+                    cleaned[str(k)] = min(1.0, max(0.05, rv))
+                except Exception:
+                    continue
+            self.source_reliability = cleaned
+        except Exception as exc:
+            LOGGER.warning("Failed to load source reliability file: %s", exc)
+            self.source_reliability = {}
+
+    def _save_source_reliability(self) -> None:
+        """保存多源可靠度缓存。"""
+        try:
+            self.report_dir.mkdir(parents=True, exist_ok=True)
+            self.source_reliability_file.write_text(
+                json.dumps(self.source_reliability, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            LOGGER.warning("Failed to save source reliability file: %s", exc)
 
     def _save_daily_realized_pnl(self) -> None:
         """持久化按日期累计的已实现盈亏。"""
@@ -702,6 +888,13 @@ class PolymarketWeatherMaster:
             live_shares = float(p.get("size", 0.0) or 0.0)
             if live_shares <= 0:
                 continue
+            # 对冲份额不能超过真实持仓份额
+            if token_id in self.synthetic_hedge_state:
+                old_hedged = float(self.synthetic_hedge_state.get(token_id, 0.0) or 0.0)
+                new_hedged = min(old_hedged, live_shares)
+                if abs(new_hedged - old_hedged) > 1e-8:
+                    self.synthetic_hedge_state[token_id] = new_hedged
+                    changed = True
             market_avg = float(p.get("avg_price", 0.0) or 0.0)
             if market_avg <= 0:
                 market_avg = float(p.get("cur_price", 0.0) or 0.0)
@@ -738,8 +931,13 @@ class PolymarketWeatherMaster:
                 if token_id not in live_token_set:
                     self.positions_cost.pop(token_id, None)
                     changed = True
+            for token_id in list(self.synthetic_hedge_state.keys()):
+                if token_id not in live_token_set:
+                    self.synthetic_hedge_state.pop(token_id, None)
+                    changed = True
         if changed:
             self._save_positions_cost()
+            self._save_synthetic_hedge_state()
 
     def _bootstrap_positions_cost_from_live_positions(self) -> None:
         """启动时执行一次成本回填，避免“有仓位但没有 entry_price”。"""
@@ -1506,6 +1704,96 @@ class PolymarketWeatherMaster:
         temp_v = self._convert_temperature(temp_c, "celsius", temp_unit)
         return {date_key: float(temp_v)}
 
+    def _source_temporal_fit(self, src_name: str, date_key: str) -> float:
+        """
+        不同源在不同预测日的时效匹配度：
+        - metar 更适合 T0（实况）
+        - nws 更适合近 1-2 天
+        - open-meteo 模型适合全区间
+        """
+        src = str(src_name or "").lower()
+        try:
+            d = datetime.strptime(str(date_key), "%Y-%m-%d").date()
+            now_d = datetime.now(self.NYC_TZ).date()
+            horizon = (d - now_d).days
+        except Exception:
+            horizon = 0
+        if "metar" in src:
+            if horizon <= 0:
+                return 1.0
+            if horizon == 1:
+                return 0.15
+            return 0.05
+        if src == "nws":
+            if horizon <= 0:
+                return 0.95
+            if horizon == 1:
+                return 0.85
+            return 0.60
+        return 0.85 if horizon <= 1 else 1.0
+
+    def _blend_sources_for_date(
+        self,
+        date_key: str,
+        source_daily: Dict[str, Dict[str, float]],
+        temp_unit: str,
+    ) -> Tuple[Optional[float], Dict[str, float], float, float]:
+        """
+        对单日做鲁棒融合，返回：
+        (blended_temp, normalized_weights, disagreement_index, confidence_score)
+        """
+        rows: List[Tuple[str, float]] = []
+        for src_name, daily in source_daily.items():
+            if date_key in daily:
+                try:
+                    rows.append((src_name, float(daily[date_key])))
+                except Exception:
+                    continue
+        if not rows:
+            return None, {}, 0.0, 0.0
+
+        values = [v for _, v in rows]
+        median_v = statistics.median(values)
+        abs_dev = [abs(v - median_v) for v in values]
+        mad = statistics.median(abs_dev) if abs_dev else 0.0
+        robust_scale = max(0.35, 1.4826 * mad)
+
+        raw_weights: Dict[str, float] = {}
+        weighted_sum = 0.0
+        weight_sum = 0.0
+        for src_name, val in rows:
+            base_w = float(self.weather_source_weights.get(src_name, 0.1))
+            rel_w = float(self.source_reliability.get(src_name, 0.75))
+            temp_fit = self._source_temporal_fit(src_name, date_key)
+            z = abs(val - median_v) / robust_scale
+            robust_penalty = 1.0 / (1.0 + z * z)
+            w = max(0.001, base_w * rel_w * temp_fit * robust_penalty)
+            raw_weights[src_name] = w
+            weighted_sum += w * val
+            weight_sum += w
+
+        if weight_sum <= 0:
+            return None, {}, 0.0, 0.0
+        blended = weighted_sum / weight_sum
+        norm_weights = {k: (v / weight_sum) for k, v in raw_weights.items()}
+        disagreement = float(statistics.pstdev(values)) if len(values) >= 2 else 0.0
+
+        # 置信度：源数量 + 分歧惩罚
+        source_count_factor = min(1.0, len(rows) / 4.0)
+        disagree_scale = 2.5 if temp_unit == "fahrenheit" else 1.4
+        disagreement_penalty = math.exp(-max(0.0, disagreement) / disagree_scale)
+        confidence = max(0.05, min(1.0, source_count_factor * disagreement_penalty))
+
+        # 用“与融合结果一致性”轻量更新可靠度（替代固定权重）
+        for src_name, val in rows:
+            old = float(self.source_reliability.get(src_name, 0.75))
+            err = abs(val - blended)
+            err_scale = 3.0 if temp_unit == "fahrenheit" else 1.7
+            score = math.exp(-err / err_scale)
+            self.source_reliability[src_name] = min(1.0, max(0.05, old * 0.98 + 0.02 * score))
+
+        return blended, norm_weights, disagreement, confidence
+
     def fetch_city_daily_max_forecast(self, city_cfg: Dict[str, Any]) -> Dict[str, float]:
         """
         多源预测融合（T0/T1/T2）：
@@ -1574,24 +1862,18 @@ class PolymarketWeatherMaster:
         if not source_daily:
             raise RuntimeError(f"All forecast sources failed for {city_cfg.get('name')}")
 
-        # 对可用源做加权融合（按可用权重归一化）
+        # 对可用源做加权融合（可靠度 + 时效匹配 + 鲁棒降权）
         blended: Dict[str, float] = {}
+        confidence_by_date: Dict[str, float] = {}
+        disagreement_by_date: Dict[str, float] = {}
+        source_weights_by_date: Dict[str, Dict[str, float]] = {}
         for date_key in required_dates:
-            weighted_sum = 0.0
-            weight_sum = 0.0
-            vals: List[Tuple[str, float]] = []
-            for src_name, daily in source_daily.items():
-                if date_key not in daily:
-                    continue
-                val = float(daily[date_key])
-                w = float(self.weather_source_weights.get(src_name, 0.1))
-                weighted_sum += val * w
-                weight_sum += w
-                vals.append((src_name, val))
-            if weight_sum > 0:
-                blended[date_key] = weighted_sum / weight_sum
-            elif vals:
-                blended[date_key] = sum(v for _, v in vals) / len(vals)
+            v, w_map, disagree, conf = self._blend_sources_for_date(date_key, source_daily, temp_unit)
+            if v is not None:
+                blended[date_key] = float(v)
+                source_weights_by_date[date_key] = {k: round(float(vv), 4) for k, vv in w_map.items()}
+                disagreement_by_date[date_key] = round(float(disagree), 4)
+                confidence_by_date[date_key] = round(float(conf), 4)
 
         missing = [k for k in required_dates if k not in blended]
         if missing:
@@ -1613,18 +1895,28 @@ class PolymarketWeatherMaster:
                     aligned_pool.append(weighted_sum / weight_sum)
             if len(aligned_pool) >= len(required_dates):
                 blended = {dk: aligned_pool[idx] for idx, dk in enumerate(required_dates)}
+                for dk in required_dates:
+                    confidence_by_date.setdefault(dk, 0.35)
+                    disagreement_by_date.setdefault(dk, 0.0)
+                    source_weights_by_date.setdefault(dk, {})
                 missing = []
             else:
                 raise RuntimeError(f"Forecast missing dates after blend: {missing}")
 
         self.current_model_details["sources"] = source_daily
+        self.current_model_details["confidence_by_date"] = confidence_by_date
+        self.current_model_details["disagreement_by_date"] = disagreement_by_date
+        self.current_model_details["source_weights_by_date"] = source_weights_by_date
         src_keys = sorted(source_daily.keys())
         self.current_model_source = f"blend:{'+'.join(src_keys)}"
+        self._save_source_reliability()
         LOGGER.info(
-            "Forecast blend %s | sources=%s | daily_max=%s",
+            "Forecast blend %s | sources=%s | daily_max=%s | conf=%s | disagree=%s",
             city_cfg.get("name", ""),
             src_keys,
             {k: round(v, 2) for k, v in blended.items()},
+            confidence_by_date,
+            disagreement_by_date,
         )
         return {k: blended[k] for k in required_dates}
 
@@ -1641,6 +1933,16 @@ class PolymarketWeatherMaster:
         if "celsius" in s or "°c" in s or re.search(r"\bc\b", s):
             return "celsius"
         if "fahrenheit" in s or "°f" in s or re.search(r"\bf\b", s):
+            return "fahrenheit"
+        return None
+
+    @staticmethod
+    def _normalize_temp_unit(unit: str) -> Optional[str]:
+        """把不同写法归一到 celsius/fahrenheit。"""
+        s = str(unit or "").strip().lower()
+        if s in ("c", "celsius", "centigrade", "degc", "°c"):
+            return "celsius"
+        if s in ("f", "fahrenheit", "degf", "°f"):
             return "fahrenheit"
         return None
 
@@ -1688,11 +1990,114 @@ class PolymarketWeatherMaster:
             return lo, hi
         return nums[0], nums[0]
 
+    def _should_use_discrete_resolution(
+        self,
+        outcome_label: str,
+        lo: Optional[float],
+        hi: Optional[float],
+        fallback_unit: Optional[str] = None,
+    ) -> bool:
+        """
+        是否启用“整度离散结算”概率模型。
+        对类似天气最高温区间（如 44-45F / 13C）启用离散处理。
+        """
+        unit = self._detect_temp_unit(outcome_label) or self._normalize_temp_unit(fallback_unit or "")
+        if unit not in ("fahrenheit", "celsius"):
+            return False
+        for v in (lo, hi):
+            if v is None:
+                continue
+            # 非整度区间（例如 1.05-1.09C）不做整度离散
+            if abs(float(v) - round(float(v))) > 0.05:
+                return False
+        return True
+
+    @staticmethod
+    def _temp_band_contains_int_degree(
+        deg: int,
+        lo: Optional[float],
+        hi: Optional[float],
+    ) -> bool:
+        """判断整数温度是否落在 outcome 区间内（闭区间语义）。"""
+        x = float(deg)
+        if lo is not None and x < float(lo):
+            return False
+        if hi is not None and x > float(hi):
+            return False
+        return True
+
+    def _discrete_degree_band_probability(
+        self,
+        mu: float,
+        sigma: float,
+        lo: Optional[float],
+        hi: Optional[float],
+    ) -> float:
+        """
+        按“整度”计算区间概率：
+        P(T in band) = Σ_k P(T=k), 其中
+        P(T=k)=CDF(k+0.5)-CDF(k-0.5)
+        """
+        sigma = max(0.2, float(sigma))
+        center = float(mu)
+        spread = max(18.0, 8.0 * sigma)
+        k_min = int(math.floor(center - spread))
+        k_max = int(math.ceil(center + spread))
+
+        # one-sided 区间把边界纳入扫描范围，避免截断丢失概率
+        if lo is not None:
+            k_min = min(k_min, int(math.floor(float(lo) - 2)))
+            k_max = max(k_max, int(math.ceil(float(lo) + spread)))
+        if hi is not None:
+            k_min = min(k_min, int(math.floor(float(hi) - spread)))
+            k_max = max(k_max, int(math.ceil(float(hi) + 2)))
+
+        # 合理物理范围裁剪，避免异常参数导致过大循环
+        k_min = max(-150, k_min)
+        k_max = min(180, k_max)
+        if k_min > k_max:
+            return 0.0
+
+        p = 0.0
+        for k in range(k_min, k_max + 1):
+            if not self._temp_band_contains_int_degree(k, lo, hi):
+                continue
+            mass = self._norm_cdf(k + 0.5, center, sigma) - self._norm_cdf(k - 0.5, center, sigma)
+            if mass > 0:
+                p += mass
+        return max(0.0, min(1.0, p))
+
     @staticmethod
     def _norm_cdf(x: float, mu: float, sigma: float) -> float:
         """正态分布 CDF，用于把温度预测转换为区间概率。"""
         z = (x - mu) / (sigma * math.sqrt(2))
         return 0.5 * (1 + math.erf(z))
+
+    @staticmethod
+    def _effective_probability_bounds(
+        lo: Optional[float],
+        hi: Optional[float],
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """
+        将“整度结算区间”映射到物理温度积分边界：
+        - [L, H] -> [L-0.5, H+0.5)
+        - (None, H] -> (-inf, H+0.5)
+        - [L, None) -> [L-0.5, +inf)
+        """
+        eff_lo = None if lo is None else float(lo) - 0.5
+        eff_hi = None if hi is None else float(hi) + 0.5
+        return eff_lo, eff_hi
+
+    @staticmethod
+    def _nearest_half_step_distance(x: float) -> float:
+        """返回与最近 n+0.5 临界点的距离。"""
+        k = math.floor(float(x))
+        half = float(k) + 0.5
+        # 最近临界点只可能是当前 half 或相邻整数上的 half
+        d0 = abs(float(x) - half)
+        d1 = abs(float(x) - (half - 1.0))
+        d2 = abs(float(x) - (half + 1.0))
+        return min(d0, d1, d2)
 
     def _dynamic_sigma(self, base_sigma: float, settle_time_iso: str = "") -> float:
         """
@@ -1739,20 +2144,23 @@ class PolymarketWeatherMaster:
         settle_time_iso: str = "",
         base_sigma_f: Optional[float] = None,
         forecast_dispersion: Optional[float] = None,
-    ) -> float:
+        return_effective_range: bool = False,
+    ) -> Union[float, Tuple[float, Optional[Dict[str, Any]]]]:
         """
         给定预测最高温，计算落入 outcome 区间的“模型概率”。
         这里用正态近似：N(mu=forecast_max, sigma=temp_sigma_f)
         """
         lo, hi = self._parse_outcome_temp_band(outcome_label)
+        forecast_unit_norm = self._normalize_temp_unit(forecast_unit) or "fahrenheit"
         outcome_unit = self._detect_temp_unit(outcome_label)
+        effective_unit = outcome_unit or forecast_unit_norm
         # 若 outcome 明确了温标，自动转换预测值到相同单位
         if outcome_unit:
             forecast_max = self._convert_temperature(forecast_max, forecast_unit, outcome_unit)
 
         # sigma 基于 outcome 单位做缩放（F -> C）
         sigma_source = float(base_sigma_f) if base_sigma_f and float(base_sigma_f) > 0 else self.temp_sigma_f
-        sigma_base = sigma_source / 1.8 if outcome_unit == "celsius" else sigma_source
+        sigma_base = sigma_source / 1.8 if effective_unit == "celsius" else sigma_source
         sigma_base = self._dynamic_sigma(sigma_base, settle_time_iso)
         # 当 HRRR 不可用时，对模型不确定性做惩罚，降低过度自信
         src_text = str(self.current_model_source or "").lower()
@@ -1762,20 +2170,42 @@ class PolymarketWeatherMaster:
         # 预测离散度动态 sigma：多源分歧越大，sigma 越大（不确定性放大）
         if isinstance(forecast_dispersion, (int, float)) and float(forecast_dispersion) > 0:
             disp = float(forecast_dispersion)
-            if outcome_unit == "celsius":
+            if effective_unit == "celsius":
                 disp = self._convert_temperature(disp, forecast_unit, "celsius")
             sigma_base = sigma_base + (0.7 * max(0.0, disp))
         # 给 sigma 设置下限，防止过小导致数值过于极端
         sigma = max(0.5, sigma_base)
 
         if lo is None and hi is None:
-            return 0.0
-        if lo is None:
-            return self._norm_cdf(hi, forecast_max, sigma)
-        if hi is None:
-            return 1.0 - self._norm_cdf(lo, forecast_max, sigma)
-        # 闭区间概率近似
-        return max(0.0, self._norm_cdf(hi, forecast_max, sigma) - self._norm_cdf(lo, forecast_max, sigma))
+            return (0.0, None) if return_effective_range else 0.0
+
+        eff_lo, eff_hi = self._effective_probability_bounds(lo, hi)
+        effective_range: Optional[Dict[str, Any]] = {
+            "raw_lo": lo,
+            "raw_hi": hi,
+            "effective_lo": eff_lo,
+            "effective_hi": eff_hi,
+            "unit": effective_unit,
+            "display": (
+                f"Range: {lo if lo is not None else '-inf'}-{hi if hi is not None else '+inf'} | "
+                f"Effective: {eff_lo if eff_lo is not None else '-inf'}-{eff_hi if eff_hi is not None else '+inf'}"
+            ),
+        }
+
+        # 与 Polymarket 最高温市场常见结算规则对齐：按整度温度离散求和
+        if self._should_use_discrete_resolution(outcome_label, lo, hi, fallback_unit=effective_unit):
+            p = self._discrete_degree_band_probability(forecast_max, sigma, lo, hi)
+            return (p, effective_range) if return_effective_range else p
+
+        # 连续近似（用于非整度区间）
+        if eff_lo is None:
+            p = self._norm_cdf(eff_hi, forecast_max, sigma)
+            return (p, effective_range) if return_effective_range else p
+        if eff_hi is None:
+            p = 1.0 - self._norm_cdf(eff_lo, forecast_max, sigma)
+            return (p, effective_range) if return_effective_range else p
+        p = max(0.0, self._norm_cdf(eff_hi, forecast_max, sigma) - self._norm_cdf(eff_lo, forecast_max, sigma))
+        return (p, effective_range) if return_effective_range else p
 
     def _is_stable_interval(
         self,
@@ -1792,12 +2222,22 @@ class PolymarketWeatherMaster:
         if probability < self.stability_prob_threshold:
             return False
         outcome_unit = self._detect_temp_unit(outcome_label)
+        boundary_buffer = float(self.boundary_buffer_f)
         if outcome_unit:
             forecast_max = self._convert_temperature(forecast_max, forecast_unit, outcome_unit)
+            # boundary_buffer_f 按华氏度配置；若 outcome 为摄氏度，先换算后再比较
+            if outcome_unit == "celsius":
+                boundary_buffer = boundary_buffer / 1.8
         lo, hi = self._parse_outcome_temp_band(outcome_label)
-        if lo is not None and forecast_max < lo + self.boundary_buffer_f:
+        # 结算临界点保护：若预测值靠近任意 .5 刻度（例如 47.5/48.5），判定为不稳定
+        # 由于 .5 间距固定为 1.0，距离最近临界点最大仅 0.5，这里将缓冲上限裁到 0.49
+        # 避免 boundary_buffer_f 配置过大导致“永远不稳定”。
+        half_step_buffer = min(0.49, max(0.0, boundary_buffer))
+        if self._nearest_half_step_distance(float(forecast_max)) < half_step_buffer:
             return False
-        if hi is not None and forecast_max > hi - self.boundary_buffer_f:
+        if lo is not None and forecast_max < lo + boundary_buffer:
+            return False
+        if hi is not None and forecast_max > hi - boundary_buffer:
             return False
         return True
 
@@ -1897,7 +2337,15 @@ class PolymarketWeatherMaster:
                 "shares": remain,
                 "highest_price_seen": old_high,
             }
+        if token_id in self.synthetic_hedge_state:
+            prev_hedged = float(self.synthetic_hedge_state.get(token_id, 0.0) or 0.0)
+            next_hedged = max(0.0, prev_hedged - float(sell_size))
+            if next_hedged <= 1e-8:
+                self.synthetic_hedge_state.pop(token_id, None)
+            else:
+                self.synthetic_hedge_state[token_id] = next_hedged
         self._save_positions_cost()
+        self._save_synthetic_hedge_state()
 
     @staticmethod
     def _extract_balance_value(payload: Dict[str, Any]) -> float:
@@ -2183,7 +2631,7 @@ class PolymarketWeatherMaster:
         ask_price = self._safe_get_price_by_side(token_id, side="BUY")
         bid_price = self._safe_get_price_by_side(token_id, side="SELL")
         spread_ratio = ((ask_price - bid_price) / ask_price) if ask_price > 0 else 1.0
-        ok = spread_ratio <= 0.05
+        ok = spread_ratio <= 0.04
         return {
             "ok": ok,
             "ask_price": float(ask_price),
@@ -2246,6 +2694,104 @@ class PolymarketWeatherMaster:
 
         raise RuntimeError(f"Unable to submit order for token {token_id}")
 
+    def _try_synthetic_close_dust(
+        self,
+        token_id: str,
+        size_shares: float,
+        opposite_token_id: Optional[str],
+        trigger_reason: str,
+        market_price: float = 0.0,
+    ) -> Dict[str, Any]:
+        """
+        Dust 仓位合成平仓（对侧对冲）：
+        - 当原仓位价值过小无法直接卖出时，尝试买入对侧 token 对冲方向风险。
+        - 注意：py-clob-client 暂无 merge/redeem 直兑接口，此处为“风险对冲”，并非立即释放 USDC。
+        """
+        token_id = str(token_id or "")
+        opp = str(opposite_token_id or "").strip()
+        if not self.enable_synthetic_close_dust:
+            return {"order_style": "SYNTHETIC_CLOSE_DISABLED", "token_id": token_id}
+        if not token_id or not opp:
+            return {
+                "order_style": "SYNTHETIC_CLOSE_UNAVAILABLE",
+                "token_id": token_id,
+                "reason": "missing_opposite_token",
+            }
+
+        unhedged = self._effective_unhedged_shares(token_id, size_shares)
+        if unhedged <= 1e-8:
+            return {
+                "order_style": "SYNTHETIC_ALREADY_HEDGED",
+                "token_id": token_id,
+                "opposite_token_id": opp,
+                "hedged_shares": round(size_shares, 6),
+            }
+
+        try:
+            opp_buy_price = self._safe_get_price_by_side(opp, side="BUY")
+        except Exception as exc:
+            return {
+                "order_style": "SYNTHETIC_CLOSE_UNAVAILABLE",
+                "token_id": token_id,
+                "opposite_token_id": opp,
+                "reason": f"opposite_price_failed:{exc}",
+            }
+        if opp_buy_price <= 0:
+            return {
+                "order_style": "SYNTHETIC_CLOSE_UNAVAILABLE",
+                "token_id": token_id,
+                "opposite_token_id": opp,
+                "reason": "invalid_opposite_price",
+            }
+
+        full_hedge_notional = unhedged * opp_buy_price
+        buy_notional = min(self.synthetic_close_max_notional_usdc, full_hedge_notional)
+        buy_notional = max(self.synthetic_close_min_notional_usdc, buy_notional)
+        est_hedged_shares = min(unhedged, buy_notional / max(opp_buy_price, 0.01))
+
+        result: Dict[str, Any]
+        if self.dry_run:
+            LOGGER.warning(
+                "\x1b[31mSYNTHETIC_CLOSE_SIGNAL\x1b[0m reason=%s token=%s opp=%s unhedged=%.4f est_hedged=%.4f buy=$%.2f mkt=%.4f",
+                trigger_reason,
+                token_id,
+                opp,
+                unhedged,
+                est_hedged_shares,
+                buy_notional,
+                market_price,
+            )
+            result = {
+                "order_style": "SYNTHETIC_DRY_RUN",
+                "token_id": token_id,
+                "opposite_token_id": opp,
+                "trigger_reason": trigger_reason,
+                "market_price": round(float(market_price), 6),
+                "opposite_buy_price": round(float(opp_buy_price), 6),
+                "unhedged_shares": round(float(unhedged), 6),
+                "buy_notional": round(float(buy_notional), 4),
+                "estimated_hedged_shares": round(float(est_hedged_shares), 6),
+            }
+        else:
+            buy_res = self._execute_buy(opp, float(buy_notional))
+            fill_price, fill_size = self._extract_fill_price_size(buy_res)
+            actual_hedged_shares = float(fill_size or est_hedged_shares or 0.0)
+            if actual_hedged_shares > 0:
+                self._register_synthetic_hedge(token_id, min(unhedged, actual_hedged_shares))
+            result = {
+                "order_style": "SYNTHETIC_HEDGE",
+                "token_id": token_id,
+                "opposite_token_id": opp,
+                "trigger_reason": trigger_reason,
+                "market_price": round(float(market_price), 6),
+                "opposite_buy_price": round(float(fill_price or opp_buy_price), 6),
+                "buy_notional": round(float(buy_notional), 4),
+                "hedged_shares": round(float(actual_hedged_shares), 6),
+                "buy_order_result": buy_res,
+            }
+
+        return result
+
     def check_and_exit_unmanaged_positions(
         self,
         covered_token_ids: set,
@@ -2261,7 +2807,8 @@ class PolymarketWeatherMaster:
             token_id = str(p.get("token_id") or "")
             if not token_id or token_id in covered_token_ids:
                 continue
-            pos = float(p.get("size", 0.0) or 0.0)
+            raw_pos = float(p.get("size", 0.0) or 0.0)
+            pos = self._effective_unhedged_shares(token_id, raw_pos)
             if pos < self.min_position_to_sell:
                 continue
             entry_price = float(self.positions_cost.get(token_id, {}).get("avg_price", 0.0) or 0.0)
@@ -2305,7 +2852,8 @@ class PolymarketWeatherMaster:
                 "edge_ratio": "",
                 "model_source": "",
                 "stable": "",
-                "current_position_shares": round(pos, 4),
+                "current_position_shares": round(raw_pos, 4),
+                "unhedged_position_shares": round(pos, 4),
                 "signal": "REDUCE",
                 "reduce_size_shares": round(sell_size, 4),
                 "entry_price": round(entry_price, 4),
@@ -2326,9 +2874,37 @@ class PolymarketWeatherMaster:
                     sell_size,
                 )
             else:
-                result = self._execute_sell(token_id, sell_size)
-                action["order_result"] = result
-                LOGGER.info("Unmanaged exit submitted reason=%s token=%s size=%.4f", exit_reason, token_id, sell_size)
+                try:
+                    est_notional = max(0.0, market_price * sell_size)
+                    if est_notional < self.exchange_min_buy_usdc:
+                        synth = self._try_synthetic_close_dust(
+                            token_id=token_id,
+                            size_shares=sell_size,
+                            opposite_token_id=self.opposite_token_map.get(token_id),
+                            trigger_reason=f"dust_{exit_reason}_unmanaged",
+                            market_price=market_price,
+                        )
+                        action["signal"] = "HOLD"
+                        action["reduce_size_shares"] = 0.0
+                        action["exit_reason"] = "synthetic_close_dust"
+                        action["hold_reason"] = "synthetic_hedged_wait_settlement"
+                        action["order_result"] = synth
+                    else:
+                        result = self._execute_sell(token_id, sell_size)
+                        action["order_result"] = result
+                        LOGGER.info("Unmanaged exit submitted reason=%s token=%s size=%.4f", exit_reason, token_id, sell_size)
+                except Exception as exc:
+                    action["signal"] = "HOLD"
+                    action["reduce_size_shares"] = 0.0
+                    action["exit_reason"] = "synthetic_close_dust"
+                    action["hold_reason"] = f"unmanaged_exit_failed:{exc}"
+                    action["order_result"] = self._try_synthetic_close_dust(
+                        token_id=token_id,
+                        size_shares=sell_size,
+                        opposite_token_id=self.opposite_token_map.get(token_id),
+                        trigger_reason=f"sell_failed_{exit_reason}_unmanaged",
+                        market_price=market_price,
+                    )
         return exits
 
     def _standby_flatten_live_positions(
@@ -2347,7 +2923,8 @@ class PolymarketWeatherMaster:
             token_id = str(p.get("token_id") or "")
             if not token_id or token_id in skip:
                 continue
-            pos = float(p.get("size", 0.0) or 0.0)
+            raw_pos = float(p.get("size", 0.0) or 0.0)
+            pos = self._effective_unhedged_shares(token_id, raw_pos)
             if pos <= 0:
                 continue
             market_price = float(p.get("cur_price", 0.0) or 0.0)
@@ -2374,7 +2951,8 @@ class PolymarketWeatherMaster:
                         "edge_ratio": "",
                         "model_source": "",
                         "stable": "",
-                        "current_position_shares": round(pos, 4),
+                        "current_position_shares": round(raw_pos, 4),
+                        "unhedged_position_shares": round(pos, 4),
                         "signal": "HOLD",
                         "reduce_size_shares": 0.0,
                         "entry_price": round(float(self.positions_cost.get(token_id, {}).get("avg_price", 0.0) or 0.0), 4),
@@ -2399,7 +2977,8 @@ class PolymarketWeatherMaster:
                 "edge_ratio": "",
                 "model_source": "",
                 "stable": "",
-                "current_position_shares": round(pos, 4),
+                "current_position_shares": round(raw_pos, 4),
+                "unhedged_position_shares": round(pos, 4),
                 "signal": "REDUCE",
                 "reduce_size_shares": round(pos, 4),
                 "entry_price": round(float(self.positions_cost.get(token_id, {}).get("avg_price", 0.0) or 0.0), 4),
@@ -2416,12 +2995,33 @@ class PolymarketWeatherMaster:
                 )
             else:
                 try:
-                    result = self._execute_sell(token_id, pos)
-                    action["order_result"] = result
+                    if est_notional < self.exchange_min_buy_usdc:
+                        synth = self._try_synthetic_close_dust(
+                            token_id=token_id,
+                            size_shares=pos,
+                            opposite_token_id=self.opposite_token_map.get(token_id),
+                            trigger_reason="standby_dust_flatten",
+                            market_price=market_price,
+                        )
+                        action["signal"] = "HOLD"
+                        action["reduce_size_shares"] = 0.0
+                        action["exit_reason"] = "synthetic_close_dust"
+                        action["hold_reason"] = "synthetic_hedged_wait_settlement"
+                        action["order_result"] = synth
+                    else:
+                        result = self._execute_sell(token_id, pos)
+                        action["order_result"] = result
                 except Exception as exc:
                     action["signal"] = "HOLD"
-                    action["exit_reason"] = ""
+                    action["exit_reason"] = "synthetic_close_dust"
                     action["hold_reason"] = f"standby_flatten_failed:{exc}"
+                    action["order_result"] = self._try_synthetic_close_dust(
+                        token_id=token_id,
+                        size_shares=pos,
+                        opposite_token_id=self.opposite_token_map.get(token_id),
+                        trigger_reason="standby_sell_failed",
+                        market_price=market_price,
+                    )
             actions.append(action)
         return actions
 
@@ -2686,21 +3286,37 @@ class PolymarketWeatherMaster:
            - pnl>=0: 按 pre_settle_reduce_fraction 减仓
         """
         exits: List[Dict[str, Any]] = []
+        hold_position_actions: List[Dict[str, Any]] = []
         hours_to_settle = self._hours_to_settle(market.settle_time_iso)
         highest_updated = False
         for item in scored:
-            pos = float(item.get("current_position_shares", 0.0))
+            raw_pos = float(item.get("current_position_shares", 0.0))
+            token_id = str(item.get("token_id") or "")
+            pos = self._effective_unhedged_shares(token_id, raw_pos)
             if pos < self.min_position_to_sell:
+                token_id_skip = token_id
+                if token_id_skip:
+                    try:
+                        self.fair_prob_state[token_id_skip] = float(item.get("fair_prob", 0.0))
+                    except Exception:
+                        pass
                 continue
 
-            token_id = str(item.get("token_id") or "")
             cost_info = self.positions_cost.get(token_id, {})
             entry_price = float(cost_info.get("avg_price", 0.0))
             if entry_price <= 0:
+                try:
+                    self.fair_prob_state[token_id] = float(item.get("fair_prob", 0.0))
+                except Exception:
+                    pass
                 continue
 
             market_price = float(item.get("market_price", 0.0))
             edge = float(item.get("edge", 0.0))
+            fair_prob_now = float(item.get("fair_prob", 0.0))
+            fair_prob_prev = float(self.fair_prob_state.get(token_id, fair_prob_now))
+            fair_prob_drop = fair_prob_prev - fair_prob_now
+            model_shift_down = fair_prob_drop >= self.model_shift_exit_delta
             pnl_ratio = (market_price - entry_price) / entry_price if entry_price > 0 else 0.0
             highest_seen = float(cost_info.get("highest_price_seen", entry_price))
             highest_seen = max(highest_seen, market_price)
@@ -2714,7 +3330,10 @@ class PolymarketWeatherMaster:
             sell_size = 0.0
             trailing_armed = highest_seen >= entry_price * 1.3
             trailing_stop_price = highest_seen * 0.9
-            if trailing_armed and market_price <= trailing_stop_price:
+            if model_shift_down and edge <= 0:
+                exit_reason = "model_shift_exit"
+                sell_size = pos
+            elif trailing_armed and market_price <= trailing_stop_price:
                 exit_reason = "trailing_stop_loss"
                 sell_size = pos
             elif market_price >= entry_price * self.take_profit_ratio:
@@ -2739,6 +3358,38 @@ class PolymarketWeatherMaster:
                 sell_size = pos
 
             if not exit_reason or sell_size < self.min_position_to_sell:
+                hold_position_actions.append(
+                    {
+                        "city": city_name,
+                        "date": item.get("date"),
+                        "date_label": item.get("date_label"),
+                        "condition_id": market.condition_id,
+                        "question": market.question,
+                        "label": f"[POSITION] {item.get('label')}",
+                        "token_id": token_id,
+                        "forecast_max": item.get("forecast_max"),
+                        "forecast_unit": item.get("forecast_unit"),
+                        "market_price": round(market_price, 4),
+                        "fair_prob": round(fair_prob_now, 4),
+                        "edge": round(edge, 4),
+                        "edge_ratio": item.get("edge_ratio", ""),
+                        "model_source": item.get("model_source", ""),
+                        "stable": item.get("stable"),
+                        "current_position_shares": round(raw_pos, 4),
+                        "unhedged_position_shares": round(pos, 4),
+                        "signal": "HOLD",
+                        "reduce_size_shares": 0.0,
+                        "entry_price": round(entry_price, 4),
+                        "unrealized_pnl": round(pnl_ratio, 4),
+                        "exit_reason": "",
+                        "hold_reason": "POSITION_KEEP",
+                        "highest_price_seen": round(highest_seen, 4),
+                        "trailing_stop_price": round(trailing_stop_price, 4) if trailing_armed else "",
+                        "fair_prob_prev": round(fair_prob_prev, 4),
+                        "fair_prob_drop": round(fair_prob_drop, 4),
+                    }
+                )
+                self.fair_prob_state[token_id] = fair_prob_now
                 continue
 
             action = {
@@ -2757,7 +3408,8 @@ class PolymarketWeatherMaster:
                 "edge_ratio": item.get("edge_ratio", ""),
                 "model_source": item.get("model_source", ""),
                 "stable": item.get("stable"),
-                "current_position_shares": round(pos, 4),
+                "current_position_shares": round(raw_pos, 4),
+                "unhedged_position_shares": round(pos, 4),
                 "signal": "REDUCE",
                 "reduce_size_shares": round(sell_size, 4),
                 "entry_price": round(entry_price, 4),
@@ -2766,9 +3418,34 @@ class PolymarketWeatherMaster:
                 "hold_reason": "",
                 "highest_price_seen": round(highest_seen, 4),
                 "trailing_stop_price": round(trailing_stop_price, 4) if trailing_armed else "",
+                "fair_prob_prev": round(fair_prob_prev, 4),
+                "fair_prob_drop": round(fair_prob_drop, 4),
             }
-            exits.append(action)
+            self.fair_prob_state[token_id] = fair_prob_now
 
+            est_notional = max(0.0, float(market_price) * float(sell_size))
+            should_try_synth = (
+                est_notional < self.exchange_min_buy_usdc
+                and bool(item.get("opposite_token_id"))
+            )
+
+            if should_try_synth:
+                synth = self._try_synthetic_close_dust(
+                    token_id=token_id,
+                    size_shares=sell_size,
+                    opposite_token_id=str(item.get("opposite_token_id") or ""),
+                    trigger_reason=f"dust_{exit_reason}",
+                    market_price=market_price,
+                )
+                action["signal"] = "HOLD"
+                action["reduce_size_shares"] = 0.0
+                action["exit_reason"] = "synthetic_close_dust"
+                action["hold_reason"] = "synthetic_hedged_wait_settlement"
+                action["order_result"] = synth
+                exits.append(action)
+                continue
+
+            exits.append(action)
             if self.dry_run:
                 LOGGER.warning(
                     "\x1b[31mEXIT_SIGNAL\x1b[0m [%s %s] reason=%s token=%s entry=%.4f now=%.4f pnl=%.2f%% size=%.4f",
@@ -2782,19 +3459,33 @@ class PolymarketWeatherMaster:
                     sell_size,
                 )
             else:
-                result = self._execute_sell(token_id, sell_size)
-                action["order_result"] = result
-                LOGGER.info(
-                    "Exit submitted [%s %s] reason=%s token=%s size=%.4f",
-                    city_name,
-                    item.get("date_label"),
-                    exit_reason,
-                    token_id,
-                    sell_size,
-                )
+                try:
+                    result = self._execute_sell(token_id, sell_size)
+                    action["order_result"] = result
+                    LOGGER.info(
+                        "Exit submitted [%s %s] reason=%s token=%s size=%.4f",
+                        city_name,
+                        item.get("date_label"),
+                        exit_reason,
+                        token_id,
+                        sell_size,
+                    )
+                except Exception as exc:
+                    synth = self._try_synthetic_close_dust(
+                        token_id=token_id,
+                        size_shares=sell_size,
+                        opposite_token_id=str(item.get("opposite_token_id") or ""),
+                        trigger_reason=f"sell_failed_{exit_reason}",
+                        market_price=market_price,
+                    )
+                    action["signal"] = "HOLD"
+                    action["reduce_size_shares"] = 0.0
+                    action["exit_reason"] = "synthetic_close_dust"
+                    action["hold_reason"] = f"sell_failed:{exc}"
+                    action["order_result"] = synth
         if highest_updated:
             self._save_positions_cost()
-        return exits
+        return exits + hold_position_actions
 
     def run_once(self) -> List[Dict[str, Any]]:
         """
@@ -2896,26 +3587,35 @@ class PolymarketWeatherMaster:
                     LOGGER.warning("%s %s forecast missing after probe.", city_name, date_key)
                     continue
                 forecast_max = forecasts[date_key]
+                confidence_map = self.current_model_details.get("confidence_by_date", {})
+                disagreement_map = self.current_model_details.get("disagreement_by_date", {})
+                source_weights_map = self.current_model_details.get("source_weights_by_date", {})
+                confidence_score = float(confidence_map.get(date_key, 0.35))
+                disagreement_index = float(disagreement_map.get(date_key, 0.0))
+                source_weights_used = source_weights_map.get(date_key, {}) if isinstance(source_weights_map, dict) else {}
                 temp_unit_label = "F" if city_cfg.get("temp_unit", "fahrenheit") == "fahrenheit" else "C"
                 LOGGER.info(
-                    "%s Date %s (%s): forecast max %.2f%s",
+                    "%s Date %s (%s): forecast max %.2f%s | confidence=%.3f disagreement=%.3f",
                     city_name,
                     date_key,
                     market.date_label,
                     forecast_max,
                     temp_unit_label,
+                    confidence_score,
+                    disagreement_index,
                 )
 
                 scored: List[Dict[str, Any]] = []
                 for out in market.outcomes:
                     covered_token_ids.add(str(out.yes_token_id))
                     covered_token_ids.add(str(out.no_token_id))
-                    fair_prob_yes = self.model_probability(
+                    fair_prob_yes, effective_range = self.model_probability(
                         forecast_max,
                         out.label,
                         forecast_unit=forecast_unit_name,
                         settle_time_iso=market.settle_time_iso,
                         base_sigma_f=city_base_sigma,
+                        return_effective_range=True,
                     )
                     fair_prob_no = max(0.0, min(1.0, 1.0 - float(fair_prob_yes)))
                     try:
@@ -2939,6 +3639,13 @@ class PolymarketWeatherMaster:
                             exc,
                         )
                         continue
+
+                    # 维护 YES/NO 对侧映射，供 dust 合成平仓使用
+                    yes_id = str(out.yes_token_id)
+                    no_id = str(out.no_token_id)
+                    if yes_id and no_id and yes_id != no_id:
+                        self.opposite_token_map[yes_id] = no_id
+                        self.opposite_token_map[no_id] = yes_id
 
                     edge_yes = fair_prob_yes - market_price_yes
                     edge_no = fair_prob_no - market_price_no
@@ -2967,12 +3674,14 @@ class PolymarketWeatherMaster:
                             "slot_key": slot_key,
                             "token_id": out.yes_token_id,
                             "opposite_token_id": out.no_token_id,
+                            "opposite_market_price": round(market_price_no, 4),
                             "forecast_max": round(forecast_max, 2),
                             "forecast_unit": temp_unit_label,
                             "market_price": round(market_price_yes, 4),
                             "fair_prob": round(fair_prob_yes, 4),
                             "edge": round(edge_yes, 4),
                             "edge_ratio": round(edge_ratio_yes, 4),
+                            "effective_range": effective_range.get("display", "") if isinstance(effective_range, dict) else "",
                             "model_source": self.current_model_source,
                             "stable": stable_yes,
                             "current_position_shares": round(current_position_yes, 4),
@@ -2990,6 +3699,9 @@ class PolymarketWeatherMaster:
                             ),
                             "exit_reason": "",
                             "base_sigma": round(city_base_sigma, 4),
+                            "confidence_score": round(confidence_score, 4),
+                            "disagreement_index": round(disagreement_index, 4),
+                            "source_weights": source_weights_used,
                         }
                     )
                     scored.append(
@@ -3005,12 +3717,14 @@ class PolymarketWeatherMaster:
                             "slot_key": slot_key,
                             "token_id": out.no_token_id,
                             "opposite_token_id": out.yes_token_id,
+                            "opposite_market_price": round(market_price_yes, 4),
                             "forecast_max": round(forecast_max, 2),
                             "forecast_unit": temp_unit_label,
                             "market_price": round(market_price_no, 4),
                             "fair_prob": round(fair_prob_no, 4),
                             "edge": round(edge_no, 4),
                             "edge_ratio": round(edge_ratio_no, 4),
+                            "effective_range": effective_range.get("display", "") if isinstance(effective_range, dict) else "",
                             "model_source": self.current_model_source,
                             "stable": stable_no,
                             "current_position_shares": round(current_position_no, 4),
@@ -3028,6 +3742,9 @@ class PolymarketWeatherMaster:
                             ),
                             "exit_reason": "",
                             "base_sigma": round(city_base_sigma, 4),
+                            "confidence_score": round(confidence_score, 4),
+                            "disagreement_index": round(disagreement_index, 4),
+                            "source_weights": source_weights_used,
                         }
                     )
                     diagnostics_rows.append(
@@ -3039,6 +3756,10 @@ class PolymarketWeatherMaster:
                             "base_label": out.label,
                             "forecast_max": round(float(forecast_max), 4),
                             "forecast_unit": temp_unit_label,
+                            "confidence_score": round(confidence_score, 4),
+                            "disagreement_index": round(disagreement_index, 4),
+                            "source_weights": source_weights_used,
+                            "effective_range": effective_range if isinstance(effective_range, dict) else {},
                             "yes": {
                                 "token_id": out.yes_token_id,
                                 "market_price": round(float(market_price_yes), 6),
@@ -3091,6 +3812,8 @@ class PolymarketWeatherMaster:
                     condition_exposure_usdc=condition_exposure_usdc,
                     total_exposure_usdc=total_exposure_usdc,
                 )
+                # 低置信度时自动缩仓，优先保证时效响应但避免“源冲突期”重仓
+                dynamic_buy_usdc = dynamic_buy_usdc * max(0.2, min(1.0, confidence_score))
                 kelly_f = self._kelly_fraction(float(best["fair_prob"]), float(best["market_price"]))
                 est_buy_shares = dynamic_buy_usdc / max(best["market_price"], 0.01)
                 projected_position = best["current_position_shares"] + est_buy_shares
@@ -3124,21 +3847,28 @@ class PolymarketWeatherMaster:
                 can_trade_amount = dynamic_buy_usdc >= effective_min_trade
                 prob_ok = float(best["fair_prob"]) >= self.min_fair_prob
                 price_low_ok = float(best["market_price"]) >= self.min_market_price
-                price_high_ok = float(best["market_price"]) <= self.max_market_price
+                is_no_side = (str(best.get("side", "")) == "NO")
+                effective_max_price = 0.50 if is_no_side else self.max_market_price
+                price_high_ok = float(best["market_price"]) <= effective_max_price
                 price_ok = price_low_ok and price_high_ok
                 edge_abs_ok = float(best["edge"]) >= self.edge_threshold
+                edge_threshold_eff = self.edge_threshold * (1.0 + (1.0 - confidence_score) * 1.5)
+                edge_abs_ok = float(best["edge"]) >= edge_threshold_eff
                 edge_ratio_v = (
                     float(best["fair_prob"]) / float(best["market_price"])
                     if float(best["market_price"]) > 0
                     else 0.0
                 )
-                edge_ratio_ok = edge_ratio_v >= self.min_edge_ratio
+                min_edge_ratio_eff = self.min_edge_ratio + (1.0 - confidence_score) * 0.4
+                edge_ratio_ok = edge_ratio_v >= min_edge_ratio_eff
+                confidence_ok = confidence_score >= self.min_confidence_score
                 should_buy = (
                     best["stable"]
                     and prob_ok
                     and price_ok
                     and edge_abs_ok
                     and edge_ratio_ok
+                    and confidence_ok
                     and can_add_position
                     and can_add_condition_total
                     and can_add_slot_direction
@@ -3155,6 +3885,11 @@ class PolymarketWeatherMaster:
                 best["dynamic_buy_usdc"] = round(dynamic_buy_usdc, 4)
                 best["kelly_fraction"] = round(kelly_f, 4)
                 best["edge_ratio"] = round(edge_ratio_v, 4)
+                best["confidence_score"] = round(confidence_score, 4)
+                best["disagreement_index"] = round(disagreement_index, 4)
+                best["source_weights"] = source_weights_used
+                best["edge_threshold_eff"] = round(edge_threshold_eff, 4)
+                best["min_edge_ratio_eff"] = round(min_edge_ratio_eff, 4)
                 best["model_source"] = self.current_model_source
                 best["total_exposure_usdc"] = round(total_exposure_usdc, 4)
                 best["can_trade_amount"] = can_trade_amount
@@ -3180,6 +3915,8 @@ class PolymarketWeatherMaster:
                     best["hold_reason"] = "EDGE_ABS_TOO_LOW"
                 elif not edge_ratio_ok:
                     best["hold_reason"] = "EDGE_RATIO_TOO_LOW"
+                elif not confidence_ok:
+                    best["hold_reason"] = "CONFIDENCE_TOO_LOW"
                 elif not settle_time_ok:
                     best["hold_reason"] = "SETTLE_TOO_NEAR"
                 elif standby_mode:
@@ -3285,6 +4022,8 @@ class PolymarketWeatherMaster:
             sold_tokens = {str(x.get("token_id") or "") for x in actions if str(x.get("signal") or "") == "REDUCE"}
             standby_actions = self._standby_flatten_live_positions(live_positions, skip_tokens=sold_tokens)
             actions.extend(standby_actions)
+        self._save_fair_prob_state()
+        self._save_opposite_token_map()
 
         self._write_diagnostics(
             {
@@ -3348,6 +4087,9 @@ if __name__ == "__main__":
     LOOP_INTERVAL_SECONDS = int(os.getenv("POLY_LOOP_INTERVAL_SECONDS", "300").strip() or "300")
     HEARTBEAT_SECONDS = int(os.getenv("POLY_HEARTBEAT_SECONDS", "3600").strip() or "3600")
     DRY_RUN = (os.getenv("POLY_DRY_RUN", "false").strip().lower() in ("1", "true", "yes", "y"))
+    ENABLE_DAILY_LOSS_STANDBY = (
+        os.getenv("POLY_ENABLE_DAILY_LOSS_STANDBY", "false").strip().lower() in ("1", "true", "yes", "y")
+    )
 
     # 创建机器人实例
     bot = PolymarketWeatherMaster(
@@ -3355,7 +4097,10 @@ if __name__ == "__main__":
         signature_type=SIGNATURE_TYPE,
         funder=FUNDER,
         investment_usdc=10.0,
-        edge_threshold=0.08,
+        edge_threshold=0.15,
+        min_fair_prob=0.20,
+        max_trade_usdc=3.0,
+        enable_daily_loss_standby=ENABLE_DAILY_LOSS_STANDBY,
         dry_run=DRY_RUN,
     )
     # 常驻运行（默认每 5 分钟一轮，每小时心跳）
