@@ -1,112 +1,162 @@
-# 🌩️Polymarket Weather Quant Bot (气象预测量化交易机器人)
+# 🌦️ Polymarket Weather Quant Bot
 
-一个专为 Polymarket 二元气象市场（最高温预测）设计的自动化量化交易机器人。
+一个面向 **Polymarket 天气市场** 的实盘量化机器人，核心目标是：
 
-本项目实现了与 Polymarket CLOB API 的自动交互，内置概率建模、凯利仓位管理和严格风控机制。  
-它通过多源气象数据融合，寻找市场错误定价（Edge），在正期望前提下执行自动化策略。
+- 用多气象源融合给出温度分布概率
+- 在 YES / NO 双向盘口中寻找定价偏差（Edge）
+- 在严格风控下自动交易、自动减仓、自动写入诊断数据
 
-## ✨核心特性
+---
 
-### 📡1. 多气象源融合 (Alpha Generation)
-- 多模型并行：Open-Meteo (HRRR, GFS Seamless, Best Match)、NWS、METAR。
-- 智能置信度加权：结合预测时距、模型可靠度、源间分歧度（Disagreement Index）动态融合。
+## ✨ 当前版本能力
 
-### 🧮 2. 精确概率建模 (Probabilistic Modeling)
-- 动态标准差（Dynamic Sigma）：随结算时间临近自动收窄。
-- 对齐 Polymarket/Wunderground 整度结算规则：按 `L-0.5` 到 `H+0.5` 计算有效概率。
+### 📡 多源天气融合
+- Open-Meteo（含 HRRR 失败自动降级）
+- NWS（美国）
+- METAR（机场实测链路）
+- 源可靠度动态权重 + 分歧指数（`disagreement_index`）
+- 置信度评分（`confidence_score`）参与交易过滤
 
-### ⚔️ 3. 双向优势驱动 (Edge-Driven Dual-Side Trading)
-- YES / NO 双向扫描，分别计算公平概率与 Edge。
-- 仅在优势满足阈值时交易（例如 `edge_threshold=0.15`）。
-- NO 方向价格上限保护（高价 NO 自动拦截，避免盈亏比失衡）。
+### 🧠 概率模型（已对齐结算规则）
+- 按市场区间计算概率，不是只看点值
+- 对整度结算区间采用有效积分范围（如区间 48-49 会按物理边界扩展）
+- 根据距离结算时间动态调整 sigma
+- 支持华氏 / 摄氏市场自动识别与计算
 
-### 🛡️4. 风控与执行 (Risk Management & Execution)
-- Fractional Kelly 动态仓位管理。
-- 止盈、止损、移动止损（Trailing Stop）。
-- Dust 合成对冲：小于最小可卖价值时，自动尝试对侧对冲风险。
-- Spread 过滤：高滑点盘口拒绝下单。
-- 日内亏损熔断（Standby）机制。
+### ⚔️ YES / NO 双向交易
+- 同一温度区间同时评估 YES 与 NO 的公平概率和 Edge
+- 统一按 Edge 排序挑选机会
+- NO 方向单独价格上限保护（防高价低盈亏比 NO）
+- 避免同一 slot 同时持有 YES 与 NO 冲突仓位
 
-## ⚙️系统架构
+### 🛡️ 实盘风控与执行
+- Fractional Kelly + 资金利用率控制
+- 最小交易额与交易所硬门槛（$1）兼容
+- 强信号小额补偿：仅在高 edge + 高置信度时补到 $1
+- 盘口价差过滤（spread filter）
+- 止盈 / 硬止损 / 模型反转 / 临近结算保护
+- 移动止损（Trailing Stop）
+- Dust 仓位合成平仓（预算上限）
+- 日内亏损熔断开关（Standby）
 
-机器人采用轮询架构（run_forever），主循环流程如下：
+### 🧾 数据与可观测性
+- JSON 报告：最新动作 + 历史快照 + diagnostics
+- MySQL 双写（可开关）
+- 扁平化分析表：`fact_bot_actions`、`dim_bot_diagnostics`
+- 真实成交流水表：`trade_history`
+- 前端历史回放页（静态）
 
-1. 市场发现（Market Discovery）：从 Gamma API 动态发现目标城市 T0/T1/T2 市场。
-2. 预测获取（Forecast Fetching）：拉取并融合多源天气数据。
-3. 概率与优势计算（Probability & Edge）：对每个 Outcome (YES/NO) 计算公平概率与 Edge。
-4. 仓位与风控检查（Sizing & Safety）：凯利仓位、暴露上限、价差过滤、熔断状态联合决策。
-5. 执行与退出（Execution & Exit）：买入、减仓、止盈止损、合成对冲。
-6. 报告输出（Reporting）：写入 `diagnostics.json` 与历史快照。
+---
 
-## 🚀安装与运行
+## 🏗️ 项目结构
 
-### 环境依赖
-- Python 3.9+
-- py-clob-client
-- requests
-- pytz
-
-### 安装步骤
-
-1. 克隆仓库
-
-```bash
-git clone https://github.com/w-cat-w/quantify.git
-cd quantify
+```text
+.
+├─ Quantify.py                      # 主策略脚本
+├─ frontend/history_viewer.html     # 静态历史回放页面
+├─ reports/                         # JSON 报告输出目录
+├─ scripts/init_mysql.sql           # MySQL 初始化脚本
+├─ scripts/migrate_json_to_mysql.py # 历史 JSON 迁移到 MySQL
+├─ .env.example                     # 环境变量模板
+└─ start_bot_watchdog.bat           # Windows 启动脚本（仓库内）
 ```
 
-2. 安装依赖
+---
+
+## 🚀 快速开始
+
+### 1) 安装依赖
 
 ```bash
 pip install -r requirements.txt
 ```
 
-3. 配置环境变量
+### 2) 配置环境变量
 
-复制 `.env.example` 为 `.env`，并填写：
+复制 `.env.example` 为 `.env`，至少配置：
 
 ```ini
-POLYMARKET_PRIVATE_KEY=0xYourPrivateKeyHere
+POLYMARKET_PRIVATE_KEY=0xYOUR_PRIVATE_KEY
 POLYMARKET_SIGNATURE_TYPE=0
 POLYMARKET_FUNDER=
-POLY_DRY_RUN=true
+
+POLY_DRY_RUN=false
+POLY_LOOP_INTERVAL_SECONDS=300
+POLY_HEARTBEAT_SECONDS=3600
+
+POLY_ENABLE_DAILY_LOSS_STANDBY=false
+
+POLY_ENABLE_DB_DUAL_WRITE=false
+POLY_DB_HOST=127.0.0.1
+POLY_DB_PORT=3306
+POLY_DB_USER=root
+POLY_DB_PASSWORD=root
+POLY_DB_NAME=quantify
+POLY_DB_CONNECT_TIMEOUT_S=5
 ```
 
-4. 启动机器人
+### 3) 运行机器人
 
 ```bash
 python Quantify.py
 ```
 
-## 📊核心参数（示例）
+---
 
-`Quantify.py` 底部可调参数示例：
+## ⚙️ 默认实盘参数（代码内）
 
-```python
-bot = PolymarketWeatherMaster(
-    private_key=PRIVATE_KEY,
-    signature_type=SIGNATURE_TYPE,
-    funder=FUNDER,
-    investment_usdc=10.0,
-    edge_threshold=0.15,
-    min_fair_prob=0.20,
-    max_trade_usdc=3.0,
-    total_exposure_limit=0.80,
-    enable_daily_loss_standby=True,
-    dry_run=False,
-)
-```
+当前 `__main__` 实例化参数为：
 
-## 输出文件
+- `investment_usdc=20.0`
+- `edge_threshold=0.12`
+- `min_confidence=0.60`
+- `min_fair_prob=0.20`
+- `max_trade_usdc=3.0`
 
-- `reports/latest_actions.json`：最新一轮动作结果
-- `reports/diagnostics.json`：高频诊断信息（含概率、Edge、价差等）
-- `reports/history/*.json`：历史快照
+说明：这是一套偏保守的实盘参数，强调过滤质量而非交易频率。📉
+
+---
+
+## 📊 输出与排障
+
+### JSON 输出
+- `reports/latest_actions.json`：最新一轮动作
+- `reports/history/*.json`：历史批次
 - `reports/history_index.json`：历史索引
+- `reports/diagnostics.json`：全量诊断（含 YES/NO 对比）
 
-## ⚠️免责声明
+### MySQL（启用双写时）
+- `fact_bot_actions`：每条策略动作（含信号、价格、edge、confidence）
+- `dim_bot_diagnostics`：模型诊断宽表（YES/NO 拆分）
+- `trade_history`：真实买卖成交流水
 
-本仓库代码仅供学术研究和技术交流使用，不构成任何投资或财务建议。
-加密货币和预测市场具有极高的波动性和归零风险。在真实环境运行本机器人会导致您钱包中的真实 USDC 发生转移。
-使用者应自行承担因软件 Bug、网络延迟、API 变更或策略失效等导致的全部财务损失。
+### 常见“没下单”原因
+- `dynamic_buy_usdc<1.0`
+- `PRICE_TOO_LOW` / `PRICE_TOO_HIGH`
+- `CONFIDENCE_TOO_LOW`
+- `EDGE_ABS_TOO_LOW` / `EDGE_RATIO_TOO_LOW`
+- `SKIP_WIDE_SPREAD`
 
+---
+
+## 🧪 前端历史回放
+
+启动静态服务后访问：
+
+- `http://127.0.0.1:8000/frontend/history_viewer.html`
+
+可按日期 / 批次查看策略行为、YES/NO 对比、过滤原因和执行结果。🧭
+
+---
+
+## 🔐 安全提示
+
+- 私钥只放 `.env`，不要提交到 Git
+- `.env`、本地 CSV、运行日志不要上传仓库
+- 建议先 `dry_run=true` 验证再实盘
+
+---
+
+## ⚠️ 免责声明
+
+本项目仅用于技术研究与策略实验，不构成任何投资建议。预测市场和加密资产波动极大，实盘可能发生全部本金损失。请仅使用可承受损失的资金。🙏
