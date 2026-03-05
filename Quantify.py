@@ -13,6 +13,10 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pytz
 import requests
+try:
+    import pymysql
+except Exception:  # pragma: no cover
+    pymysql = None
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import AssetType, BalanceAllowanceParams, MarketOrderArgs, OrderArgs
 from py_clob_client.constants import POLYGON
@@ -353,12 +357,13 @@ class PolymarketWeatherMaster:
         signature_type: int = 0,
         funder: Optional[str] = None,
         investment_usdc: float = 1.0,
-        bankroll_fraction: float = 0.18,
+        bankroll_fraction: float = 0.30,
         edge_threshold: float = 0.10,
         min_fair_prob: float = 0.15,
         min_market_price: float = 0.10,
         max_market_price: float = 0.70,
         min_edge_ratio: float = 1.25,
+        min_confidence: float = 0.60,
         min_confidence_score: float = 0.45,
         temp_sigma_f: float = 2.0,
         stability_prob_threshold: float = 0.70,
@@ -400,6 +405,13 @@ class PolymarketWeatherMaster:
         daily_realized_pnl_file: str = "daily_realized_pnl.json",
         fair_prob_state_file: str = "fair_prob_state.json",
         source_reliability_file: str = "source_reliability.json",
+        enable_db_dual_write: bool = False,
+        db_host: str = "127.0.0.1",
+        db_port: int = 3306,
+        db_user: str = "root",
+        db_password: str = "root",
+        db_name: str = "quantify",
+        db_connect_timeout_s: int = 5,
         report_dir: str = "reports",
         write_static_report: bool = True,
         write_history_report: bool = True,
@@ -428,8 +440,10 @@ class PolymarketWeatherMaster:
         self.max_market_price = max(self.min_market_price, min(1.0, max_market_price))
         # 最低相对优势倍数 fair_prob/market_price
         self.min_edge_ratio = max(1.0, min_edge_ratio)
-        # 最低置信度，低于该值不新开仓
-        self.min_confidence_score = min(1.0, max(0.0, float(min_confidence_score)))
+        # 最低置信度，低于该值不新开仓（新参数）
+        self.min_confidence = min(1.0, max(0.0, float(min_confidence)))
+        # 兼容旧字段：保持同值，避免历史代码路径引用报错
+        self.min_confidence_score = self.min_confidence
         # 温度预测分布的标准差（华氏度）
         self.temp_sigma_f = temp_sigma_f
         # “稳定落入区间”的最小概率阈值
@@ -513,6 +527,15 @@ class PolymarketWeatherMaster:
         self.request_timeout_s = request_timeout_s
         # dry_run=True 时只打信号不真实下单
         self.dry_run = dry_run
+        # 数据双写（JSON + MySQL）
+        self.enable_db_dual_write = bool(enable_db_dual_write)
+        self.db_host = str(db_host or "127.0.0.1")
+        self.db_port = int(db_port or 3306)
+        self.db_user = str(db_user or "root")
+        self.db_password = str(db_password or "")
+        self.db_name = str(db_name or "quantify")
+        self.db_connect_timeout_s = max(1, int(db_connect_timeout_s))
+        self._db_ready = False
 
         # HTTP 会话复用（减少连接开销）
         self.session = requests.Session()
@@ -541,7 +564,7 @@ class PolymarketWeatherMaster:
         self._load_opposite_token_map()
         # 合成平仓对冲状态：记录每个 token 已对冲份额，避免重复无效操作
         self.synthetic_hedge_state_file = self.report_dir / synthetic_hedge_state_file
-        self.synthetic_hedge_state: Dict[str, float] = {}
+        self.synthetic_hedge_state: Dict[str, Dict[str, float]] = {}
         self._load_synthetic_hedge_state()
         # 日内已实现盈亏，结构：{YYYY-MM-DD: pnl_usdc}
         self.daily_realized_pnl_file = self.report_dir / daily_realized_pnl_file
@@ -578,6 +601,527 @@ class PolymarketWeatherMaster:
             "User-Agent": "polymarket-weather-master/3.0 (local-bot; contact=codex@example.com)",
             "Accept": "application/geo+json, application/json",
         }
+        # token -> city 轻量缓存（用于交易流水写库时反查城市）
+        self.token_city_hint_map: Dict[str, str] = {}
+        self._setup_db_if_enabled()
+
+    def _setup_db_if_enabled(self) -> None:
+        """初始化数据库双写能力（失败不影响主流程）。"""
+        if not self.enable_db_dual_write:
+            self._db_ready = False
+            return
+        if pymysql is None:
+            LOGGER.warning("DB dual-write enabled but PyMySQL not installed. Disable DB writer.")
+            self._db_ready = False
+            return
+        try:
+            with pymysql.connect(
+                host=self.db_host,
+                port=self.db_port,
+                user=self.db_user,
+                password=self.db_password,
+                database=self.db_name,
+                charset="utf8mb4",
+                connect_timeout=self.db_connect_timeout_s,
+                autocommit=True,
+            ) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                self._init_db(conn)
+            self._db_ready = True
+            LOGGER.info("DB dual-write ready: %s:%s/%s", self.db_host, self.db_port, self.db_name)
+        except Exception as exc:
+            self._db_ready = False
+            LOGGER.warning("DB dual-write init failed: %s", exc)
+
+    def _init_db(self, conn) -> None:
+        """初始化（或升级）数据库表结构。"""
+        ddl_list = [
+            """
+            CREATE TABLE IF NOT EXISTS fact_bot_actions (
+              id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+              event_ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '入库时间',
+              city VARCHAR(50) NULL COMMENT '城市',
+              date_label VARCHAR(50) NULL COMMENT '日期标签',
+              condition_id TEXT NULL COMMENT '条件ID',
+              token_id VARCHAR(100) NULL COMMENT 'Token ID',
+              trade_signal VARCHAR(20) NULL COMMENT '信号(BUY/HOLD/REDUCE)',
+              market_price DOUBLE NULL COMMENT '市场价格',
+              fair_prob DOUBLE NULL COMMENT '公平概率',
+              edge DOUBLE NULL COMMENT '边际优势',
+              confidence_score DOUBLE NULL COMMENT '置信度',
+              disagreement_index DOUBLE NULL COMMENT '分歧指数',
+              dynamic_buy_usdc DOUBLE NULL COMMENT '动态买入金额(USDC)',
+              hold_reason TEXT NULL COMMENT '持有原因',
+              PRIMARY KEY (id),
+              KEY idx_fact_actions_time (event_ts),
+              KEY idx_fact_actions_city_date (city, date_label),
+              KEY idx_fact_actions_signal (trade_signal),
+              KEY idx_fact_actions_token (token_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS dim_bot_diagnostics (
+              id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+              event_ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '入库时间',
+              city VARCHAR(50) NULL COMMENT '城市',
+              date_label VARCHAR(50) NULL COMMENT '日期标签',
+              forecast_max DOUBLE NULL COMMENT '预测最高温',
+              confidence_score DOUBLE NULL COMMENT '置信度',
+              disagreement_index DOUBLE NULL COMMENT '分歧指数',
+              yes_token_id VARCHAR(100) NULL COMMENT 'YES Token ID',
+              yes_market_price DOUBLE NULL COMMENT 'YES市场价',
+              yes_fair_prob DOUBLE NULL COMMENT 'YES公平概率',
+              yes_edge DOUBLE NULL COMMENT 'YES边际优势',
+              no_token_id VARCHAR(100) NULL COMMENT 'NO Token ID',
+              no_market_price DOUBLE NULL COMMENT 'NO市场价',
+              no_fair_prob DOUBLE NULL COMMENT 'NO公平概率',
+              no_edge DOUBLE NULL COMMENT 'NO边际优势',
+              PRIMARY KEY (id),
+              KEY idx_dim_diag_time (event_ts),
+              KEY idx_dim_diag_city_date (city, date_label)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS trade_history (
+              id INT AUTO_INCREMENT PRIMARY KEY,
+              `timestamp` DATETIME DEFAULT CURRENT_TIMESTAMP,
+              bot_action VARCHAR(20),
+              token_id VARCHAR(100),
+              city VARCHAR(50),
+              price DOUBLE,
+              shares DOUBLE,
+              notional DOUBLE,
+              raw_json JSON
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+            """,
+        ]
+        with conn.cursor() as cur:
+            for ddl in ddl_list:
+                cur.execute(ddl)
+            # 老版本兼容升级：把可能与关键字冲突的旧列名改为非关键字风格
+            try:
+                cur.execute("SHOW COLUMNS FROM fact_bot_actions LIKE 'timestamp'")
+                if cur.fetchone():
+                    cur.execute(
+                        """
+                        ALTER TABLE fact_bot_actions
+                        CHANGE COLUMN `timestamp` event_ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '入库时间'
+                        """
+                    )
+            except Exception:
+                pass
+            try:
+                cur.execute("SHOW COLUMNS FROM fact_bot_actions LIKE 'signal'")
+                if cur.fetchone():
+                    cur.execute(
+                        """
+                        ALTER TABLE fact_bot_actions
+                        CHANGE COLUMN `signal` trade_signal VARCHAR(20) NULL COMMENT '信号(BUY/HOLD/REDUCE)'
+                        """
+                    )
+            except Exception:
+                pass
+            try:
+                cur.execute("SHOW COLUMNS FROM dim_bot_diagnostics LIKE 'timestamp'")
+                if cur.fetchone():
+                    cur.execute(
+                        """
+                        ALTER TABLE dim_bot_diagnostics
+                        CHANGE COLUMN `timestamp` event_ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '入库时间'
+                        """
+                    )
+            except Exception:
+                pass
+            try:
+                cur.execute("SHOW TABLES LIKE 'trade_history'")
+                if cur.fetchone():
+                    cur.execute("SHOW COLUMNS FROM trade_history LIKE 'action'")
+                    if cur.fetchone():
+                        cur.execute(
+                            """
+                            ALTER TABLE trade_history
+                            CHANGE COLUMN `action` bot_action VARCHAR(20)
+                            """
+                        )
+            except Exception:
+                pass
+
+    def _db_connect(self):
+        """创建数据库连接（内部使用）。"""
+        if not self.enable_db_dual_write or not self._db_ready or pymysql is None:
+            return None
+        return pymysql.connect(
+            host=self.db_host,
+            port=self.db_port,
+            user=self.db_user,
+            password=self.db_password,
+            database=self.db_name,
+            charset="utf8mb4",
+            connect_timeout=self.db_connect_timeout_s,
+            autocommit=True,
+        )
+
+    def _mysql_execute(self, sql: str, params: Tuple[Any, ...]) -> None:
+        """执行单条 MySQL 语句（异常抛给上层处理）。"""
+        conn = self._db_connect()
+        if conn is None:
+            return
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+
+    def _remember_token_city(self, token_id: str, city: str) -> None:
+        """记录 token 与城市映射，供成交写库时兜底反查。"""
+        tk = str(token_id or "").strip()
+        ct = str(city or "").strip()
+        if tk and ct:
+            self.token_city_hint_map[tk] = ct
+
+    def _resolve_city_by_token(self, token_id: str) -> str:
+        """通过 token 反查城市，查不到返回空字符串。"""
+        tk = str(token_id or "").strip()
+        if not tk:
+            return ""
+        return str(self.token_city_hint_map.get(tk, "") or "")
+
+    @staticmethod
+    def _safe_float(v: Any) -> Optional[float]:
+        try:
+            if v in ("", None):
+                return None
+            return float(v)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _safe_int(v: Any) -> Optional[int]:
+        try:
+            if v in ("", None):
+                return None
+            return int(v)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _truncate_text(v: Any, max_len: int) -> Optional[str]:
+        s = str(v or "").strip()
+        if not s:
+            return None
+        if len(s) > max_len:
+            return s[:max_len]
+        return s
+
+    def _db_write_run_actions(
+        self,
+        generated_at: str,
+        generated_at_iso: str,
+        date_key: str,
+        actions: List[Dict[str, Any]],
+        run_summary: Dict[str, Any],
+        source_file: str = "",
+        progress: Optional[Dict[str, Any]] = None,
+        payload_json: Optional[str] = None,
+    ) -> None:
+        """把一次 run 的 summary + actions 写入 MySQL。"""
+        if not self.enable_db_dual_write or not self._db_ready:
+            return
+        phase = ""
+        if isinstance(progress, dict):
+            phase = str(progress.get("stage", "") or "")
+        run_uid = f"{generated_at_iso}|{source_file or 'latest'}|{phase or 'final'}"
+        sig = run_summary.get("signal_summary", {}) if isinstance(run_summary, dict) else {}
+        dis = run_summary.get("discovery_summary", {}) if isinstance(run_summary, dict) else {}
+        progress = progress if isinstance(progress, dict) else {}
+        try:
+            conn = self._db_connect()
+            if conn is None:
+                return
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO bot_runs (
+                          run_uid, generated_at_iso, generated_at_local, date_key, source_file,
+                          total_rows, buy_count, hold_count, reduce_count, discovery_found, discovery_skip,
+                          progress_stage, progress_city, progress_city_index, progress_total_cities, payload_json
+                        ) VALUES (
+                          %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+                        )
+                        ON DUPLICATE KEY UPDATE
+                          generated_at_local=VALUES(generated_at_local),
+                          date_key=VALUES(date_key),
+                          source_file=VALUES(source_file),
+                          total_rows=VALUES(total_rows),
+                          buy_count=VALUES(buy_count),
+                          hold_count=VALUES(hold_count),
+                          reduce_count=VALUES(reduce_count),
+                          discovery_found=VALUES(discovery_found),
+                          discovery_skip=VALUES(discovery_skip),
+                          progress_stage=VALUES(progress_stage),
+                          progress_city=VALUES(progress_city),
+                          progress_city_index=VALUES(progress_city_index),
+                          progress_total_cities=VALUES(progress_total_cities),
+                          payload_json=VALUES(payload_json)
+                        """,
+                        (
+                            run_uid,
+                            generated_at_iso,
+                            generated_at,
+                            date_key,
+                            source_file,
+                            self._safe_int(run_summary.get("total_rows") if isinstance(run_summary, dict) else None),
+                            self._safe_int(sig.get("BUY") if isinstance(sig, dict) else None),
+                            self._safe_int(sig.get("HOLD") if isinstance(sig, dict) else None),
+                            self._safe_int(sig.get("REDUCE") if isinstance(sig, dict) else None),
+                            self._safe_int(dis.get("FOUND") if isinstance(dis, dict) else None),
+                            self._safe_int(dis.get("SKIP") if isinstance(dis, dict) else None),
+                            str(progress.get("stage") or "") or None,
+                            str(progress.get("city") or "") or None,
+                            self._safe_int(progress.get("city_index")),
+                            self._safe_int(progress.get("total_cities")),
+                            payload_json,
+                        ),
+                    )
+                    cur.execute("SELECT id FROM bot_runs WHERE run_uid=%s LIMIT 1", (run_uid,))
+                    row = cur.fetchone()
+                    if not row:
+                        return
+                    run_id = int(row[0])
+                    cur.execute("DELETE FROM bot_actions WHERE run_id=%s", (run_id,))
+                    if actions:
+                        sql = """
+                            INSERT INTO bot_actions (
+                              run_id, action_index, city, action_date, date_label, action_signal, action_side, label,
+                              token_id, opposite_token_id, condition_id, question,
+                              market_price, fair_prob, edge, edge_ratio, hold_reason, exit_reason, raw_json
+                            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        """
+                        rows = []
+                        for idx, act in enumerate(actions):
+                            if not isinstance(act, dict):
+                                continue
+                            rows.append(
+                                (
+                                    run_id,
+                                    idx,
+                                    str(act.get("city") or "") or None,
+                                    str(act.get("date") or "") or None,
+                                    str(act.get("date_label") or "") or None,
+                                    str(act.get("signal") or "") or None,
+                                    str(act.get("side") or "") or None,
+                                    str(act.get("label") or "") or None,
+                                    str(act.get("token_id") or "") or None,
+                                    str(act.get("opposite_token_id") or "") or None,
+                                    str(act.get("condition_id") or "") or None,
+                                    str(act.get("question") or "") or None,
+                                    self._safe_float(act.get("market_price")),
+                                    self._safe_float(act.get("fair_prob")),
+                                    self._safe_float(act.get("edge")),
+                                    self._safe_float(act.get("edge_ratio")),
+                                    str(act.get("hold_reason") or "") or None,
+                                    str(act.get("exit_reason") or "") or None,
+                                    json.dumps(act, ensure_ascii=False),
+                                )
+                            )
+                        if rows:
+                            cur.executemany(sql, rows)
+        except Exception as exc:
+            LOGGER.warning("DB write run/actions failed: %s", exc)
+
+    def _db_write_diagnostics(self, payload: Dict[str, Any]) -> None:
+        """把 diagnostics.json 同步写入 MySQL。"""
+        if not self.enable_db_dual_write or not self._db_ready or not isinstance(payload, dict):
+            return
+        generated_at_iso = str(payload.get("generated_at_iso") or "")
+        if not generated_at_iso:
+            return
+        generated_at = str(payload.get("generated_at") or "")
+        mode = str(payload.get("mode") or "")
+        sig = payload.get("signal_summary", {}) if isinstance(payload.get("signal_summary"), dict) else {}
+        rows = payload.get("rows", [])
+        diag_uid = f"{generated_at_iso}|{mode or 'unknown'}"
+        try:
+            conn = self._db_connect()
+            if conn is None:
+                return
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO bot_diagnostics (
+                          diag_uid, generated_at_iso, generated_at_local, mode,
+                          buy_count, hold_count, reduce_count, rows_count, payload_json
+                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON DUPLICATE KEY UPDATE
+                          generated_at_local=VALUES(generated_at_local),
+                          mode=VALUES(mode),
+                          buy_count=VALUES(buy_count),
+                          hold_count=VALUES(hold_count),
+                          reduce_count=VALUES(reduce_count),
+                          rows_count=VALUES(rows_count),
+                          payload_json=VALUES(payload_json)
+                        """,
+                        (
+                            diag_uid,
+                            generated_at_iso,
+                            generated_at,
+                            mode,
+                            self._safe_int(sig.get("BUY") if isinstance(sig, dict) else None),
+                            self._safe_int(sig.get("HOLD") if isinstance(sig, dict) else None),
+                            self._safe_int(sig.get("REDUCE") if isinstance(sig, dict) else None),
+                            len(rows) if isinstance(rows, list) else 0,
+                            json.dumps(payload, ensure_ascii=False),
+                        ),
+                    )
+        except Exception as exc:
+            LOGGER.warning("DB write diagnostics failed: %s", exc)
+
+    def _write_actions_to_db(self, actions: List[Dict[str, Any]]) -> None:
+        """扁平化写入 fact_bot_actions（不影响交易主流程）。"""
+        if not self.enable_db_dual_write or not self._db_ready:
+            return
+        if not isinstance(actions, list) or not actions:
+            return
+        rows: List[Tuple[Any, ...]] = []
+        for act in actions:
+            if not isinstance(act, dict):
+                continue
+            try:
+                self._remember_token_city(str(act.get("token_id") or ""), str(act.get("city") or ""))
+                rows.append(
+                    (
+                        self._truncate_text(act.get("city"), 50),
+                        self._truncate_text(act.get("date_label"), 50),
+                        self._truncate_text(act.get("condition_id"), 255),
+                        self._truncate_text(act.get("token_id"), 100),
+                        self._truncate_text(act.get("signal"), 20),
+                        self._safe_float(act.get("market_price")),
+                        self._safe_float(act.get("fair_prob")),
+                        self._safe_float(act.get("edge")),
+                        self._safe_float(act.get("confidence_score")),
+                        self._safe_float(act.get("disagreement_index")),
+                        self._safe_float(act.get("dynamic_buy_usdc")),
+                        self._truncate_text(act.get("hold_reason"), 65535),
+                    )
+                )
+            except Exception as exc:
+                LOGGER.warning("Flatten action row parse failed, skip one row: %s", exc)
+                continue
+        if not rows:
+            return
+        try:
+            conn = self._db_connect()
+            if conn is None:
+                return
+            with conn:
+                with conn.cursor() as cur:
+                    cur.executemany(
+                        """
+                        INSERT INTO fact_bot_actions (
+                          city, date_label, condition_id, token_id, trade_signal,
+                          market_price, fair_prob, edge, confidence_score, disagreement_index,
+                          dynamic_buy_usdc, hold_reason
+                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        """,
+                        rows,
+                    )
+        except Exception as exc:
+            LOGGER.warning("Flatten actions DB write failed: %s", exc)
+
+    def _write_diagnostics_to_db(self, diagnostics_payload: Dict[str, Any]) -> None:
+        """扁平化写入 dim_bot_diagnostics（不影响交易主流程）。"""
+        if not self.enable_db_dual_write or not self._db_ready:
+            return
+        if not isinstance(diagnostics_payload, dict):
+            return
+        rows_payload = diagnostics_payload.get("rows", [])
+        if not isinstance(rows_payload, list) or not rows_payload:
+            return
+        rows: List[Tuple[Any, ...]] = []
+        for item in rows_payload:
+            if not isinstance(item, dict):
+                continue
+            try:
+                yes = item.get("yes", {}) if isinstance(item.get("yes"), dict) else {}
+                no = item.get("no", {}) if isinstance(item.get("no"), dict) else {}
+                rows.append(
+                    (
+                        self._truncate_text(item.get("city"), 50),
+                        self._truncate_text(item.get("date_label"), 50),
+                        self._safe_float(item.get("forecast_max")),
+                        self._safe_float(item.get("confidence_score")),
+                        self._safe_float(item.get("disagreement_index")),
+                        self._truncate_text(yes.get("token_id"), 100),
+                        self._safe_float(yes.get("market_price")),
+                        self._safe_float(yes.get("fair_prob")),
+                        self._safe_float(yes.get("edge")),
+                        self._truncate_text(no.get("token_id"), 100),
+                        self._safe_float(no.get("market_price")),
+                        self._safe_float(no.get("fair_prob")),
+                        self._safe_float(no.get("edge")),
+                    )
+                )
+            except Exception as exc:
+                LOGGER.warning("Flatten diagnostics row parse failed, skip one row: %s", exc)
+                continue
+        if not rows:
+            return
+        try:
+            conn = self._db_connect()
+            if conn is None:
+                return
+            with conn:
+                with conn.cursor() as cur:
+                    cur.executemany(
+                        """
+                        INSERT INTO dim_bot_diagnostics (
+                          city, date_label, forecast_max, confidence_score, disagreement_index,
+                          yes_token_id, yes_market_price, yes_fair_prob, yes_edge,
+                          no_token_id, no_market_price, no_fair_prob, no_edge
+                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        """,
+                        rows,
+                    )
+        except Exception as exc:
+            LOGGER.warning("Flatten diagnostics DB write failed: %s", exc)
+
+    def _write_trade_to_db(
+        self,
+        bot_action: str,
+        token_id: str,
+        city: str,
+        price: float,
+        shares: float,
+        notional: float,
+        raw_data: Dict[str, Any],
+    ) -> None:
+        """专门用于记录真实发生的买卖交易流水。"""
+        if not self.enable_db_dual_write or not self._db_ready:
+            return
+        sql = """
+            INSERT INTO trade_history
+            (bot_action, token_id, city, price, shares, notional, raw_json)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """
+        try:
+            token_id_s = str(token_id or "").strip()
+            city_s = str(city or "").strip() or self._resolve_city_by_token(token_id_s)
+            raw_json_str = json.dumps(raw_data, ensure_ascii=False) if raw_data else "{}"
+            self._mysql_execute(
+                sql,
+                (
+                    str(bot_action or ""),
+                    token_id_s,
+                    city_s,
+                    self._safe_float(price),
+                    self._safe_float(shares),
+                    self._safe_float(notional),
+                    raw_json_str,
+                ),
+            )
+        except Exception as e:
+            LOGGER.warning("[MySQL] 写入 trade_history 失败: %s", e)
 
     def _load_positions_cost(self) -> None:
         """从本地 JSON 读取持仓成本，避免重启后丢失。"""
@@ -647,7 +1191,7 @@ class PolymarketWeatherMaster:
             LOGGER.warning("Failed to save opposite token map: %s", exc)
 
     def _load_synthetic_hedge_state(self) -> None:
-        """加载合成平仓对冲份额状态。"""
+        """加载合成平仓状态（兼容旧版: token->shares；新版: token->{hedged_shares,total_spent_usdc}）。"""
         try:
             if not self.synthetic_hedge_state_file.exists():
                 self.synthetic_hedge_state = {}
@@ -656,13 +1200,30 @@ class PolymarketWeatherMaster:
             if not isinstance(raw, dict):
                 self.synthetic_hedge_state = {}
                 return
-            cleaned: Dict[str, float] = {}
+            cleaned: Dict[str, Dict[str, float]] = {}
             for k, v in raw.items():
                 try:
                     token_id = str(k or "").strip()
-                    fv = float(v)
-                    if token_id and fv > 0:
-                        cleaned[token_id] = fv
+                    if not token_id:
+                        continue
+                    # 兼容旧结构：直接是数值（仅 hedged_shares）
+                    if isinstance(v, (int, float, str)):
+                        hedged = float(v)
+                        if hedged > 0:
+                            cleaned[token_id] = {
+                                "hedged_shares": hedged,
+                                "total_spent_usdc": 0.0,
+                            }
+                        continue
+                    # 新结构
+                    if isinstance(v, dict):
+                        hedged = float(v.get("hedged_shares", 0.0) or 0.0)
+                        spent = float(v.get("total_spent_usdc", 0.0) or 0.0)
+                        if hedged > 0 or spent > 0:
+                            cleaned[token_id] = {
+                                "hedged_shares": max(0.0, hedged),
+                                "total_spent_usdc": max(0.0, spent),
+                            }
                 except Exception:
                     continue
             self.synthetic_hedge_state = cleaned
@@ -681,20 +1242,51 @@ class PolymarketWeatherMaster:
         except Exception as exc:
             LOGGER.warning("Failed to save synthetic hedge state: %s", exc)
 
+    def _get_hedge_entry(self, token_id: str) -> Dict[str, float]:
+        """读取单 token 合成平仓状态。"""
+        tk = str(token_id or "").strip()
+        if not tk:
+            return {"hedged_shares": 0.0, "total_spent_usdc": 0.0}
+        raw = self.synthetic_hedge_state.get(tk, {})
+        if isinstance(raw, dict):
+            return {
+                "hedged_shares": max(0.0, float(raw.get("hedged_shares", 0.0) or 0.0)),
+                "total_spent_usdc": max(0.0, float(raw.get("total_spent_usdc", 0.0) or 0.0)),
+            }
+        # 兼容异常旧值
+        try:
+            return {"hedged_shares": max(0.0, float(raw or 0.0)), "total_spent_usdc": 0.0}
+        except Exception:
+            return {"hedged_shares": 0.0, "total_spent_usdc": 0.0}
+
+    def _set_hedge_entry(self, token_id: str, hedged_shares: float, total_spent_usdc: float) -> None:
+        """写入单 token 合成平仓状态。"""
+        tk = str(token_id or "").strip()
+        if not tk:
+            return
+        hs = max(0.0, float(hedged_shares or 0.0))
+        spent = max(0.0, float(total_spent_usdc or 0.0))
+        if hs <= 1e-8 and spent <= 1e-8:
+            self.synthetic_hedge_state.pop(tk, None)
+            return
+        self.synthetic_hedge_state[tk] = {"hedged_shares": hs, "total_spent_usdc": spent}
+
     def _effective_unhedged_shares(self, token_id: str, total_shares: float) -> float:
         """返回扣除已合成对冲后的未对冲份额。"""
-        hedged = float(self.synthetic_hedge_state.get(str(token_id), 0.0) or 0.0)
+        hedged = float(self._get_hedge_entry(token_id).get("hedged_shares", 0.0))
         return max(0.0, float(total_shares) - hedged)
 
-    def _register_synthetic_hedge(self, token_id: str, hedged_shares: float) -> None:
-        """累加 token 的已对冲份额。"""
-        if hedged_shares <= 0:
+    def _register_synthetic_hedge(self, token_id: str, hedged_shares: float, spent_usdc: float) -> None:
+        """累加 token 的已对冲份额和累计花费。"""
+        if hedged_shares <= 0 and spent_usdc <= 0:
             return
         tk = str(token_id or "")
         if not tk:
             return
-        prev = float(self.synthetic_hedge_state.get(tk, 0.0) or 0.0)
-        self.synthetic_hedge_state[tk] = max(0.0, prev + float(hedged_shares))
+        prev = self._get_hedge_entry(tk)
+        new_hedged = float(prev.get("hedged_shares", 0.0)) + max(0.0, float(hedged_shares))
+        new_spent = float(prev.get("total_spent_usdc", 0.0)) + max(0.0, float(spent_usdc))
+        self._set_hedge_entry(tk, new_hedged, new_spent)
         self._save_synthetic_hedge_state()
 
     def _load_daily_realized_pnl(self) -> None:
@@ -890,10 +1482,11 @@ class PolymarketWeatherMaster:
                 continue
             # 对冲份额不能超过真实持仓份额
             if token_id in self.synthetic_hedge_state:
-                old_hedged = float(self.synthetic_hedge_state.get(token_id, 0.0) or 0.0)
+                entry = self._get_hedge_entry(token_id)
+                old_hedged = float(entry.get("hedged_shares", 0.0))
                 new_hedged = min(old_hedged, live_shares)
                 if abs(new_hedged - old_hedged) > 1e-8:
-                    self.synthetic_hedge_state[token_id] = new_hedged
+                    self._set_hedge_entry(token_id, new_hedged, float(entry.get("total_spent_usdc", 0.0)))
                     changed = True
             market_avg = float(p.get("avg_price", 0.0) or 0.0)
             if market_avg <= 0:
@@ -2338,12 +2931,13 @@ class PolymarketWeatherMaster:
                 "highest_price_seen": old_high,
             }
         if token_id in self.synthetic_hedge_state:
-            prev_hedged = float(self.synthetic_hedge_state.get(token_id, 0.0) or 0.0)
+            entry = self._get_hedge_entry(token_id)
+            prev_hedged = float(entry.get("hedged_shares", 0.0))
             next_hedged = max(0.0, prev_hedged - float(sell_size))
             if next_hedged <= 1e-8:
                 self.synthetic_hedge_state.pop(token_id, None)
             else:
-                self.synthetic_hedge_state[token_id] = next_hedged
+                self._set_hedge_entry(token_id, next_hedged, float(entry.get("total_spent_usdc", 0.0)))
         self._save_positions_cost()
         self._save_synthetic_hedge_state()
 
@@ -2577,6 +3171,8 @@ class PolymarketWeatherMaster:
         token_exposure_usdc: float,
         condition_exposure_usdc: float,
         total_exposure_usdc: float,
+        edge_abs: Optional[float] = None,
+        confidence_score: Optional[float] = None,
     ) -> float:
         """
         基于凯利公式 + 多层风控计算本次 BUY 金额（USDC）。
@@ -2606,8 +3202,14 @@ class PolymarketWeatherMaster:
             global_cap_budget,
             self.max_trade_usdc,
         )
-        # 小额账户起注补偿：满足主策略条件时，金额不足 $1 也抬到 $1（交易所硬门槛）
-        edge_abs = fair_prob - market_price
+        # 先在内部做置信度缩放，避免外部再次打折导致补偿失效
+        conf = 0.0 if confidence_score is None else float(confidence_score)
+        budget = budget * max(0.2, min(1.0, conf))
+
+        # 小额账户起注补偿（收紧版）：
+        # 仅在“强信号”时才把不足 $1 的下单抬到 $1，避免噪音单硬凑起注。
+        if edge_abs is None:
+            edge_abs = fair_prob - market_price
         edge_ratio = (fair_prob / market_price) if market_price > 0 else 0.0
         if (
             0 < budget < self.exchange_min_buy_usdc
@@ -2615,7 +3217,8 @@ class PolymarketWeatherMaster:
             and fair_prob >= self.min_fair_prob
             and market_price >= self.min_market_price
             and market_price <= self.max_market_price
-            and edge_abs >= self.edge_threshold
+            and float(edge_abs) >= 0.20
+            and conf >= 0.75
             and edge_ratio >= self.min_edge_ratio
         ):
             budget = min(self.exchange_min_buy_usdc, self.max_trade_usdc)
@@ -2639,7 +3242,13 @@ class PolymarketWeatherMaster:
             "spread_ratio": float(spread_ratio),
         }
 
-    def _execute_buy(self, token_id: str, amount_usdc: float, fair_price: Optional[float] = None) -> Dict[str, Any]:
+    def _execute_buy(
+        self,
+        token_id: str,
+        amount_usdc: float,
+        fair_price: Optional[float] = None,
+        city: str = "",
+    ) -> Dict[str, Any]:
         """
         市价 BUY（FOK）：
         - 直接按金额下市价单，减少挂限价导致的错失与抖动
@@ -2683,7 +3292,19 @@ class PolymarketWeatherMaster:
                 fill_price, fill_size = self._extract_fill_price_size(result)
                 fallback_price = self._safe_get_price(token_id)
                 fallback_size = notional / max(fallback_price, 0.01)
-                self._update_cost_on_buy(token_id, fill_price or fallback_price, fill_size or fallback_size)
+                exec_price = float(fill_price or fallback_price or 0.0)
+                exec_size = float(fill_size or fallback_size or 0.0)
+                self._update_cost_on_buy(token_id, exec_price, exec_size)
+                if exec_price > 0 and exec_size > 0:
+                    self._write_trade_to_db(
+                        bot_action="Buy",
+                        token_id=token_id,
+                        city=city,
+                        price=exec_price,
+                        shares=exec_size,
+                        notional=float(notional),
+                        raw_data=result if isinstance(result, dict) else {"result": str(result)},
+                    )
                 return result
             except PolyApiException as exc:
                 if attempt == 0 and exc.status_code in (401, 403):
@@ -2745,8 +3366,32 @@ class PolymarketWeatherMaster:
             }
 
         full_hedge_notional = unhedged * opp_buy_price
-        buy_notional = min(self.synthetic_close_max_notional_usdc, full_hedge_notional)
-        buy_notional = max(self.synthetic_close_min_notional_usdc, buy_notional)
+        hedge_entry = self._get_hedge_entry(token_id)
+        already_spent = float(hedge_entry.get("total_spent_usdc", 0.0))
+        max_budget = float(self.synthetic_close_max_notional_usdc)
+        remaining_budget = max(0.0, max_budget - already_spent)
+        if remaining_budget <= 1e-8:
+            return {
+                "order_style": "SYNTHETIC_BUDGET_EXHAUSTED",
+                "token_id": token_id,
+                "opposite_token_id": opp,
+                "trigger_reason": trigger_reason,
+                "already_spent_usdc": round(already_spent, 4),
+                "budget_cap_usdc": round(max_budget, 4),
+            }
+        # 先算理论对冲金额，再受剩余预算硬限制
+        buy_notional = min(remaining_budget, full_hedge_notional)
+        # 剩余预算不足最小下单额时，不再继续投入
+        if buy_notional < self.synthetic_close_min_notional_usdc:
+            return {
+                "order_style": "SYNTHETIC_BUDGET_REMAIN_TOO_SMALL",
+                "token_id": token_id,
+                "opposite_token_id": opp,
+                "trigger_reason": trigger_reason,
+                "already_spent_usdc": round(already_spent, 4),
+                "remaining_budget_usdc": round(remaining_budget, 4),
+                "min_notional_usdc": round(float(self.synthetic_close_min_notional_usdc), 4),
+            }
         est_hedged_shares = min(unhedged, buy_notional / max(opp_buy_price, 0.01))
 
         result: Dict[str, Any]
@@ -2773,11 +3418,21 @@ class PolymarketWeatherMaster:
                 "estimated_hedged_shares": round(float(est_hedged_shares), 6),
             }
         else:
-            buy_res = self._execute_buy(opp, float(buy_notional))
+            buy_res = self._execute_buy(
+                opp,
+                float(buy_notional),
+                city=self._resolve_city_by_token(token_id),
+            )
             fill_price, fill_size = self._extract_fill_price_size(buy_res)
             actual_hedged_shares = float(fill_size or est_hedged_shares or 0.0)
+            spent_usdc = float(buy_res.get("amount_usdc", buy_notional) or buy_notional)
+            spent_usdc = max(0.0, min(spent_usdc, remaining_budget))
             if actual_hedged_shares > 0:
-                self._register_synthetic_hedge(token_id, min(unhedged, actual_hedged_shares))
+                self._register_synthetic_hedge(
+                    token_id,
+                    min(unhedged, actual_hedged_shares),
+                    spent_usdc,
+                )
             result = {
                 "order_style": "SYNTHETIC_HEDGE",
                 "token_id": token_id,
@@ -2786,6 +3441,9 @@ class PolymarketWeatherMaster:
                 "market_price": round(float(market_price), 6),
                 "opposite_buy_price": round(float(fill_price or opp_buy_price), 6),
                 "buy_notional": round(float(buy_notional), 4),
+                "already_spent_usdc": round(already_spent, 4),
+                "remaining_budget_usdc": round(remaining_budget, 4),
+                "spent_usdc": round(spent_usdc, 4),
                 "hedged_shares": round(float(actual_hedged_shares), 6),
                 "buy_order_result": buy_res,
             }
@@ -2890,7 +3548,11 @@ class PolymarketWeatherMaster:
                         action["hold_reason"] = "synthetic_hedged_wait_settlement"
                         action["order_result"] = synth
                     else:
-                        result = self._execute_sell(token_id, sell_size)
+                        result = self._execute_sell(
+                            token_id,
+                            sell_size,
+                            city=str(action.get("city") or ""),
+                        )
                         action["order_result"] = result
                         LOGGER.info("Unmanaged exit submitted reason=%s token=%s size=%.4f", exit_reason, token_id, sell_size)
                 except Exception as exc:
@@ -3009,7 +3671,11 @@ class PolymarketWeatherMaster:
                         action["hold_reason"] = "synthetic_hedged_wait_settlement"
                         action["order_result"] = synth
                     else:
-                        result = self._execute_sell(token_id, pos)
+                        result = self._execute_sell(
+                            token_id,
+                            pos,
+                            city=str(action.get("city") or ""),
+                        )
                         action["order_result"] = result
                 except Exception as exc:
                     action["signal"] = "HOLD"
@@ -3025,7 +3691,7 @@ class PolymarketWeatherMaster:
             actions.append(action)
         return actions
 
-    def _execute_sell(self, token_id: str, size_shares: float) -> Dict[str, Any]:
+    def _execute_sell(self, token_id: str, size_shares: float, city: str = "") -> Dict[str, Any]:
         """
         提交 SELL 单（优先 FOK，失败时回退 GTC）：
         - 对低价值 Dust 仓位，使用更激进折价，提升成交概率
@@ -3042,7 +3708,7 @@ class PolymarketWeatherMaster:
                 limit_price = max(0.01, ref_sell_price * (1.0 - discount))
 
                 entry_price = float(self.positions_cost.get(str(token_id), {}).get("avg_price", 0.0) or 0.0)
-                order_types = ["FOK", "GTC"] if est_notional < self.dust_notional_threshold_usdc else ["FOK"]
+                order_types = ["FOK", "GTC"]
                 last_exc: Optional[Exception] = None
                 for order_type in order_types:
                     try:
@@ -3074,6 +3740,16 @@ class PolymarketWeatherMaster:
                             realized_pnl = (realized_fill_price - entry_price) * realized_fill_size
                             self._record_realized_pnl(realized_pnl)
                             result["realized_pnl"] = round(realized_pnl, 6)
+                        if realized_fill_size > 0 and realized_fill_price > 0:
+                            self._write_trade_to_db(
+                                bot_action="Sell",
+                                token_id=token_id,
+                                city=city,
+                                price=float(realized_fill_price),
+                                shares=float(realized_fill_size),
+                                notional=float(realized_fill_price * realized_fill_size),
+                                raw_data=result if isinstance(result, dict) else {"result": str(result)},
+                            )
                         return result
                     except PolyApiException as inner_exc:
                         last_exc = inner_exc
@@ -3205,6 +3881,16 @@ class PolymarketWeatherMaster:
         idx_data["history"] = history
         idx_data["updated_at"] = generated_at
         idx_path.write_text(json.dumps(idx_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._db_write_run_actions(
+            generated_at=generated_at,
+            generated_at_iso=generated_dt.isoformat(),
+            date_key=date_key,
+            actions=actions,
+            run_summary=run_summary,
+            source_file=rel_file,
+            progress=None,
+            payload_json=json.dumps(snap_payload, ensure_ascii=False),
+        )
 
         LOGGER.info("History snapshot written: %s | index=%s", rel_file, idx_path)
 
@@ -3230,6 +3916,16 @@ class PolymarketWeatherMaster:
 
         json_path = self.report_dir / "latest_actions.json"
         json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._db_write_run_actions(
+            generated_at=generated_at,
+            generated_at_iso=generated_dt.isoformat(),
+            date_key=generated_dt.strftime("%Y-%m-%d"),
+            actions=actions,
+            run_summary=run_summary,
+            source_file="latest_actions.json",
+            progress=progress,
+            payload_json=json.dumps(payload, ensure_ascii=False),
+        )
         LOGGER.info("Static report written: %s", json_path)
 
         should_write_history = self.write_history_report if write_history is None else bool(write_history)
@@ -3267,6 +3963,8 @@ class PolymarketWeatherMaster:
                 json.dumps(payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            self._db_write_diagnostics(payload)
+            self._write_diagnostics_to_db(payload)
         except Exception as exc:
             LOGGER.warning("Failed to write diagnostics file: %s", exc)
 
@@ -3311,7 +4009,7 @@ class PolymarketWeatherMaster:
                     pass
                 continue
 
-            market_price = float(item.get("market_price", 0.0))
+            market_price = float(item.get("bid_price", item.get("market_price", 0.0)))
             edge = float(item.get("edge", 0.0))
             fair_prob_now = float(item.get("fair_prob", 0.0))
             fair_prob_prev = float(self.fair_prob_state.get(token_id, fair_prob_now))
@@ -3460,7 +4158,7 @@ class PolymarketWeatherMaster:
                 )
             else:
                 try:
-                    result = self._execute_sell(token_id, sell_size)
+                    result = self._execute_sell(token_id, sell_size, city=city_name)
                     action["order_result"] = result
                     LOGGER.info(
                         "Exit submitted [%s %s] reason=%s token=%s size=%.4f",
@@ -3624,10 +4322,18 @@ class PolymarketWeatherMaster:
                         LOGGER.warning("Skip YES token price unavailable: token=%s err=%s", out.yes_token_id, exc)
                         continue
                     try:
+                        bid_price_yes = self._safe_get_price_by_side(out.yes_token_id, side="SELL")
+                    except Exception:
+                        bid_price_yes = float(market_price_yes)
+                    try:
                         market_price_no = self._safe_get_price(out.no_token_id)
                     except Exception as exc:
                         LOGGER.warning("Skip NO token price unavailable: token=%s err=%s", out.no_token_id, exc)
                         continue
+                    try:
+                        bid_price_no = self._safe_get_price_by_side(out.no_token_id, side="SELL")
+                    except Exception:
+                        bid_price_no = float(market_price_no)
                     try:
                         current_position_yes = self._safe_get_token_position(out.yes_token_id)
                         current_position_no = self._safe_get_token_position(out.no_token_id)
@@ -3646,6 +4352,8 @@ class PolymarketWeatherMaster:
                     if yes_id and no_id and yes_id != no_id:
                         self.opposite_token_map[yes_id] = no_id
                         self.opposite_token_map[no_id] = yes_id
+                    self._remember_token_city(yes_id, city_name)
+                    self._remember_token_city(no_id, city_name)
 
                     edge_yes = fair_prob_yes - market_price_yes
                     edge_no = fair_prob_no - market_price_no
@@ -3678,6 +4386,7 @@ class PolymarketWeatherMaster:
                             "forecast_max": round(forecast_max, 2),
                             "forecast_unit": temp_unit_label,
                             "market_price": round(market_price_yes, 4),
+                            "bid_price": round(float(bid_price_yes), 4),
                             "fair_prob": round(fair_prob_yes, 4),
                             "edge": round(edge_yes, 4),
                             "edge_ratio": round(edge_ratio_yes, 4),
@@ -3721,6 +4430,7 @@ class PolymarketWeatherMaster:
                             "forecast_max": round(forecast_max, 2),
                             "forecast_unit": temp_unit_label,
                             "market_price": round(market_price_no, 4),
+                            "bid_price": round(float(bid_price_no), 4),
                             "fair_prob": round(fair_prob_no, 4),
                             "edge": round(edge_no, 4),
                             "edge_ratio": round(edge_ratio_no, 4),
@@ -3811,9 +4521,9 @@ class PolymarketWeatherMaster:
                     token_exposure_usdc=token_exposure_usdc,
                     condition_exposure_usdc=condition_exposure_usdc,
                     total_exposure_usdc=total_exposure_usdc,
+                    edge_abs=float(best["edge"]),
+                    confidence_score=float(confidence_score),
                 )
-                # 低置信度时自动缩仓，优先保证时效响应但避免“源冲突期”重仓
-                dynamic_buy_usdc = dynamic_buy_usdc * max(0.2, min(1.0, confidence_score))
                 kelly_f = self._kelly_fraction(float(best["fair_prob"]), float(best["market_price"]))
                 est_buy_shares = dynamic_buy_usdc / max(best["market_price"], 0.01)
                 projected_position = best["current_position_shares"] + est_buy_shares
@@ -3848,7 +4558,7 @@ class PolymarketWeatherMaster:
                 prob_ok = float(best["fair_prob"]) >= self.min_fair_prob
                 price_low_ok = float(best["market_price"]) >= self.min_market_price
                 is_no_side = (str(best.get("side", "")) == "NO")
-                effective_max_price = 0.50 if is_no_side else self.max_market_price
+                effective_max_price = 0.55 if is_no_side else self.max_market_price
                 price_high_ok = float(best["market_price"]) <= effective_max_price
                 price_ok = price_low_ok and price_high_ok
                 edge_abs_ok = float(best["edge"]) >= self.edge_threshold
@@ -3861,7 +4571,7 @@ class PolymarketWeatherMaster:
                 )
                 min_edge_ratio_eff = self.min_edge_ratio + (1.0 - confidence_score) * 0.4
                 edge_ratio_ok = edge_ratio_v >= min_edge_ratio_eff
-                confidence_ok = confidence_score >= self.min_confidence_score
+                confidence_ok = confidence_score >= self.min_confidence
                 should_buy = (
                     best["stable"]
                     and prob_ok
@@ -3985,6 +4695,7 @@ class PolymarketWeatherMaster:
                                 best["token_id"],
                                 dynamic_buy_usdc,
                                 fair_price=float(best["fair_prob"]),
+                                city=str(best.get("city") or ""),
                             )
                             best["order_result"] = result
                             if str(result.get("order_style", "")) == "SKIP_WIDE_SPREAD":
@@ -4024,6 +4735,7 @@ class PolymarketWeatherMaster:
             actions.extend(standby_actions)
         self._save_fair_prob_state()
         self._save_opposite_token_map()
+        self._write_actions_to_db(actions)
 
         self._write_diagnostics(
             {
@@ -4090,17 +4802,34 @@ if __name__ == "__main__":
     ENABLE_DAILY_LOSS_STANDBY = (
         os.getenv("POLY_ENABLE_DAILY_LOSS_STANDBY", "false").strip().lower() in ("1", "true", "yes", "y")
     )
+    ENABLE_DB_DUAL_WRITE = (
+        os.getenv("POLY_ENABLE_DB_DUAL_WRITE", "false").strip().lower() in ("1", "true", "yes", "y")
+    )
+    DB_HOST = os.getenv("POLY_DB_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    DB_PORT = int(os.getenv("POLY_DB_PORT", "3306").strip() or "3306")
+    DB_USER = os.getenv("POLY_DB_USER", "root").strip() or "root"
+    DB_PASSWORD = os.getenv("POLY_DB_PASSWORD", "root")
+    DB_NAME = os.getenv("POLY_DB_NAME", "quantify").strip() or "quantify"
+    DB_CONNECT_TIMEOUT_S = int(os.getenv("POLY_DB_CONNECT_TIMEOUT_S", "5").strip() or "5")
 
     # 创建机器人实例
     bot = PolymarketWeatherMaster(
         private_key=PRIVATE_KEY,
         signature_type=SIGNATURE_TYPE,
         funder=FUNDER,
-        investment_usdc=10.0,
-        edge_threshold=0.15,
+        investment_usdc=20.0,
+        edge_threshold=0.12,
+        min_confidence=0.60,
         min_fair_prob=0.20,
         max_trade_usdc=3.0,
         enable_daily_loss_standby=ENABLE_DAILY_LOSS_STANDBY,
+        enable_db_dual_write=ENABLE_DB_DUAL_WRITE,
+        db_host=DB_HOST,
+        db_port=DB_PORT,
+        db_user=DB_USER,
+        db_password=DB_PASSWORD,
+        db_name=DB_NAME,
+        db_connect_timeout_s=DB_CONNECT_TIMEOUT_S,
         dry_run=DRY_RUN,
     )
     # 常驻运行（默认每 5 分钟一轮，每小时心跳）
